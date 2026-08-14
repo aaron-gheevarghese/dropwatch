@@ -30,5 +30,12 @@ class Settings(BaseSettings):
     outbox_backoff_base_seconds: int = 5
     outbox_backoff_max_seconds: int = 300
 
+    zscore_window: int = 60
+    zscore_min_observations: int = 30
+    # No PRD-given number for this — it's explicitly "configurable". A 0.5% move on a
+    # dead-flat window is the kind of thing worth a fallback alert on; much smaller than
+    # that and it's more likely tick noise on a thin/rounding price than a real move.
+    zscore_zero_variance_min_percent: Decimal = Decimal("0.5")
+
 
 settings = Settings()

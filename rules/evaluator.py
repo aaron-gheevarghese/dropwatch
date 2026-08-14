@@ -1,8 +1,8 @@
 """Evaluates AlertRules against a freshly observed price and fires Notification +
 OutboxEvent rows in the same transaction as the PriceHistory write that triggered them.
 
-Only absolute_below/absolute_above are implemented — percent_change, zscore_move, and
-spread_widen are Step 7.
+absolute_below/absolute_above/zscore_move are implemented — percent_change and
+spread_widen remain Step 7.
 
 Two independent guards apply, in order:
 
@@ -20,6 +20,7 @@ Two independent guards apply, in order:
 
 import hashlib
 import json
+import math
 from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
@@ -28,9 +29,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import AlertRule, Notification, OutboxEvent, Pair
+from config.settings import settings
+from db.models import AlertRule, Notification, OutboxEvent, Pair, PriceHistory
+from workers.zscore_filter import ZScoreResult, compute_zscore
 
-IMPLEMENTED_RULE_TYPES = ("absolute_below", "absolute_above")
+IMPLEMENTED_RULE_TYPES = ("absolute_below", "absolute_above", "zscore_move")
 STATUS_PENDING = "pending"
 STATUS_SUPPRESSED_COOLDOWN = "suppressed_cooldown"
 
@@ -67,12 +70,70 @@ def rule_fires(rule: AlertRule, price: Decimal) -> bool:
     return False
 
 
-def _format_message(pair: Pair, rule: AlertRule, price: Decimal, observed_at: datetime) -> str:
-    direction_text = "dropped below" if rule.rule_type == "absolute_below" else "rose above"
-    return (
-        f"{pair.display_name} {direction_text} {rule.threshold} "
-        f"(observed {price} at {observed_at.astimezone(UTC).isoformat()})"
+def zscore_rule_fires(rule: AlertRule, result: ZScoreResult | None, zero_variance_min_percent: Decimal) -> bool:
+    if result is None or rule.sigma is None:
+        return False
+
+    direction = rule.direction or "both"
+
+    if result.is_zero_variance:
+        # e^r - 1 is the exact percent change (log-return only approximates percent
+        # change for small moves, and a flat/zero-variance window is precisely the
+        # degenerate case where that approximation shouldn't be trusted).
+        percent_change = abs(math.expm1(result.current_return)) * 100
+        if percent_change < float(zero_variance_min_percent):
+            return False
+        if direction == "down":
+            return result.current_return < 0
+        if direction == "up":
+            return result.current_return > 0
+        return True
+
+    sigma = float(rule.sigma)
+    z = result.z
+    if direction == "down":
+        return z <= -sigma
+    if direction == "up":
+        return z >= sigma
+    return abs(z) >= sigma
+
+
+async def _fetch_recent_prices(session: AsyncSession, pair: Pair, limit: int) -> list[Decimal]:
+    # Ordinary SELECT — autoflush means the PriceHistory row the poller just added for
+    # this exact observation (pending, not yet committed) is flushed and visible here
+    # within the same transaction, so it's naturally included as the newest price with
+    # no special-casing. No interpolation happens anywhere in this query: it returns
+    # whatever real rows exist, however irregularly spaced a gap left them.
+    result = await session.execute(
+        select(PriceHistory.last_price)
+        .where(PriceHistory.pair_id == pair.id)
+        .order_by(PriceHistory.observed_at.desc())
+        .limit(limit)
     )
+    prices_desc = list(result.scalars())
+    return list(reversed(prices_desc))
+
+
+def _format_message(
+    pair: Pair,
+    rule: AlertRule,
+    price: Decimal,
+    observed_at: datetime,
+    zscore_result: ZScoreResult | None = None,
+) -> str:
+    timestamp = observed_at.astimezone(UTC).isoformat()
+
+    if rule.rule_type == "zscore_move":
+        assert zscore_result is not None
+        percent = math.expm1(zscore_result.current_return) * 100
+        if zscore_result.is_zero_variance:
+            detail = f"flat-window fallback move of {percent:+.3f}% (baseline window had zero variance)"
+        else:
+            detail = f"z={zscore_result.z:+.2f} (sigma threshold {rule.sigma}, return {percent:+.3f}%)"
+        return f"{pair.display_name} z-score move: {detail} (observed {price} at {timestamp})"
+
+    direction_text = "dropped below" if rule.rule_type == "absolute_below" else "rose above"
+    return f"{pair.display_name} {direction_text} {rule.threshold} (observed {price} at {timestamp})"
 
 
 def _in_cooldown(rule: AlertRule, observed_at: datetime) -> bool:
@@ -85,9 +146,9 @@ def _in_cooldown(rule: AlertRule, observed_at: datetime) -> bool:
 async def evaluate_rules_for_pair(
     session: AsyncSession, pair: Pair, price: Decimal, observed_at: datetime
 ) -> list[Notification]:
-    """Fires any absolute_below/absolute_above rule for this pair that the given price
-    qualifies for. Returns the Notifications actually created — delivered or
-    suppressed — empty if nothing fired or everything was a duplicate of an
+    """Fires any absolute_below/absolute_above/zscore_move rule for this pair that the
+    given price qualifies for. Returns the Notifications actually created — delivered
+    or suppressed — empty if nothing fired or everything was a duplicate of an
     already-recorded detected state.
     """
     result = await session.execute(
@@ -101,8 +162,24 @@ async def evaluate_rules_for_pair(
 
     created: list[Notification] = []
 
+    # Computed at most once per pair evaluation, lazily — only if some rule needs it —
+    # and shared across every zscore_move rule for this pair rather than refetched per rule.
+    zscore_result: ZScoreResult | None = None
+    zscore_computed = False
+
     for rule in rules:
-        if not rule_fires(rule, price):
+        if rule.rule_type == "zscore_move":
+            if not zscore_computed:
+                prices = await _fetch_recent_prices(session, pair, settings.zscore_window + 2)
+                zscore_result = compute_zscore(
+                    prices, window=settings.zscore_window, min_observations=settings.zscore_min_observations
+                )
+                zscore_computed = True
+            fires = zscore_rule_fires(rule, zscore_result, settings.zscore_zero_variance_min_percent)
+        else:
+            fires = rule_fires(rule, price)
+
+        if not fires:
             continue
 
         state_hash = compute_detected_state_hash(rule, price, observed_at)
@@ -146,9 +223,12 @@ async def evaluate_rules_for_pair(
                     "pair_display_name": pair.display_name,
                     "rule_type": rule.rule_type,
                     "threshold": str(rule.threshold) if rule.threshold is not None else None,
+                    "sigma": str(rule.sigma) if rule.sigma is not None else None,
+                    "direction": rule.direction,
+                    "z_score": zscore_result.z if (rule.rule_type == "zscore_move" and zscore_result) else None,
                     "detected_price": str(price),
                     "triggered_at": observed_at.astimezone(UTC).isoformat(),
-                    "message": _format_message(pair, rule, price, observed_at),
+                    "message": _format_message(pair, rule, price, observed_at, zscore_result),
                 }
             )
             session.add(OutboxEvent(notification_id=notification.id, payload=payload))

@@ -88,9 +88,9 @@ class AlertRule(Base):
         UUID(as_uuid=True), ForeignKey("pairs.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
-    # "absolute_below" | "absolute_above" implemented now; "percent_change" |
-    # "zscore_move" | "spread_widen" are Step 7 — the columns they need already exist
-    # below so the table doesn't need reshaping when they're wired up.
+    # "absolute_below" | "absolute_above" | "zscore_move" implemented now;
+    # "percent_change" | "spread_widen" remain Step 7 — the columns they need already
+    # exist below so the table doesn't need reshaping when they're wired up.
     rule_type: Mapped[str] = mapped_column(String, nullable=False)
 
     threshold: Mapped[Decimal | None] = mapped_column(Numeric(24, 8), nullable=True)

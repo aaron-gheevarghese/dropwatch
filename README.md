@@ -23,6 +23,11 @@ a `Notification` + `OutboxEvent` in the *same transaction* as the price observat
 `outbox_publisher` is the only thing that talks to SNS, decoupled from evaluation so a
 firing is never lost even if SNS is briefly unreachable.
 
+Rule evaluation (`rules/evaluator.py`) supports three rule types: `absolute_below`/
+`absolute_above` (fixed threshold) and `zscore_move` (statistical: fires when a price's
+log return is an outlier relative to that pair's own recent rolling volatility, not a
+fixed percentage — see `workers/zscore_filter.py` and the measurement note below).
+
 ```
 Kraken API
     │
@@ -136,15 +141,40 @@ yet either; run it locally or add a service for it the same way.
 | `ALERT_EMAIL` | yes (for delivery) | — | Where alert emails go — also seeded as the v1 user's `contact` |
 | `OUTBOX_BACKOFF_BASE_SECONDS` | no | `5` | Outbox publisher retry backoff, first attempt |
 | `OUTBOX_BACKOFF_MAX_SECONDS` | no | `300` | Outbox publisher retry backoff cap |
+| `ZSCORE_WINDOW` | no | `60` | Rolling baseline size (prior returns) for `zscore_move` |
+| `ZSCORE_MIN_OBSERVATIONS` | no | `30` | Minimum prior returns required before a `zscore_move` rule can fire at all |
+| `ZSCORE_ZERO_VARIANCE_MIN_PERCENT` | no | `0.5` | Fallback minimum percent move required to fire when the baseline window has zero variance (division by zero otherwise) |
 
 ## API
 
 - `POST /pairs`, `GET /pairs` — track/list Kraken pairs
-- `POST /rules` — create an alert rule (`absolute_below`/`absolute_above` only for now)
+- `POST /rules` — create an alert rule (`absolute_below`/`absolute_above`/`zscore_move`;
+  `percent_change`/`spread_widen` remain Step 7)
 - `PATCH /rules/{id}` — enable, disable, or modify an existing rule
 - `GET /alerts` — alert history: rule fired, observed price, delivery status (including
   suppression reason), outbox retry diagnostics. Paginated (`limit`/`offset`), filterable
   by `pair_id`, `rule_id`, `status`.
+
+## Statistical filter (zscore_move)
+
+`workers/zscore_filter.py` computes `z = (r_t - mean(r_window)) / stdev(r_window)` over
+log returns from real `PriceHistory` rows, with a 60-observation rolling window, a
+30-observation minimum before it'll fire at all, and a configurable minimum-percent
+fallback for zero-variance windows. No interpolation — a gap between two real
+observations just becomes one return computed over however much time actually elapsed.
+
+**Measured, not asserted** — `python -m scripts.build_zscore_fixture` extracts real
+captured price history into the version-controlled `tests/fixtures/zscore_fixture.json`
+(118 real pairs, ~142k observations), and `python -m scripts.measure_zscore_filter`
+measures the filter against it and writes `docs/zscore_measurement_report.md`. The
+finding is more nuanced than a single percentage — read the full report, but in short:
+z-score's fire rate is **~5.5x more consistent across pairs of different volatility**
+than a fixed threshold (that's the actual mechanism this feature is supposed to
+provide, and it measures out real), while the literal "total fires vs. one fixed
+threshold" framing is threshold-dependent and often *unfavorable* to z-score at
+realistic thresholds, because a 2-sigma cutoff has a fixed ~4.55%+ theoretical fire
+rate that a fixed percentage threshold isn't bound by. No specific percentage from
+that report should be quoted out of context.
 
 ## Testing
 
@@ -167,10 +197,18 @@ This needs a working `DATABASE_URL` in `.env` to run.
   models, rule evaluation wired into the poller, `POST /rules`, SNS provisioning,
   outbox publisher. Done.
 - **Step 4 — Hardening:** cooldown suppression, `GET /alerts`, `PATCH /rules/{id}`,
-  formalized idempotency/redelivery/cooldown test suite. Done (this step).
+  formalized idempotency/redelivery/cooldown test suite. Done.
+- **Step 5 — Statistical filter:** `zscore_move` rule type, real-data measurement
+  against a version-controlled fixture. Done — see
+  [Statistical filter](#statistical-filter-zscore_move) above. The measured result is a
+  genuine finding, not a target hit: z-score gives ~5.5x more consistent alert rates
+  across pairs of different volatility than a fixed threshold, which is the real,
+  substantiated value proposition; the literal "% fewer false positives than one fixed
+  threshold" framing turned out to be threshold-dependent and often unfavorable at
+  realistic thresholds. Full writeup in `docs/zscore_measurement_report.md`.
 - **Not yet built:**
   - EC2 deploy (currently runs from a laptop/dev machine only)
-  - `percent_change`, `zscore_move`, `spread_widen` rule types (Step 7)
+  - `percent_change`, `spread_widen` rule types (Step 7)
   - Indexed/batched rule evaluation — currently a naive per-pair scan (Step 6)
   - Load testing at the 500+ pairs/minute target
   - A way to discover the seeded user's ID via the API (currently: check the DB or

@@ -12,6 +12,24 @@ from rules.evaluator import IMPLEMENTED_RULE_TYPES
 
 router = APIRouter(prefix="/rules", tags=["rules"])
 
+ZSCORE_DIRECTIONS = ("up", "down", "both")
+
+
+def _validate_rule_fields(
+    rule_type: str, threshold: Decimal | None, sigma: Decimal | None, direction: str | None
+) -> None:
+    if rule_type not in IMPLEMENTED_RULE_TYPES:
+        raise ValueError(
+            f"rule_type must be one of {IMPLEMENTED_RULE_TYPES} for now (percent_change, spread_widen remain Step 7)"
+        )
+    if rule_type in ("absolute_below", "absolute_above") and threshold is None:
+        raise ValueError(f"threshold is required for rule_type={rule_type!r}")
+    if rule_type == "zscore_move":
+        if sigma is None:
+            raise ValueError(f"sigma is required for rule_type={rule_type!r}")
+        if direction is not None and direction not in ZSCORE_DIRECTIONS:
+            raise ValueError(f"direction must be one of {ZSCORE_DIRECTIONS} for rule_type={rule_type!r}")
+
 
 class CreateRuleRequest(BaseModel):
     user_id: UUID
@@ -26,14 +44,8 @@ class CreateRuleRequest(BaseModel):
     is_enabled: bool = True
 
     @model_validator(mode="after")
-    def _validate_rule_type(self) -> "CreateRuleRequest":
-        if self.rule_type not in IMPLEMENTED_RULE_TYPES:
-            raise ValueError(
-                f"rule_type must be one of {IMPLEMENTED_RULE_TYPES} for now "
-                f"(percent_change, zscore_move, spread_widen land in Step 7)"
-            )
-        if self.threshold is None:
-            raise ValueError(f"threshold is required for rule_type={self.rule_type!r}")
+    def _validate(self) -> "CreateRuleRequest":
+        _validate_rule_fields(self.rule_type, self.threshold, self.sigma, self.direction)
         return self
 
 
@@ -116,11 +128,10 @@ async def update_rule(
     for field, value in body.model_dump(exclude_unset=True).items():
         setattr(rule, field, value)
 
-    if rule.rule_type in IMPLEMENTED_RULE_TYPES and rule.threshold is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"threshold is required for rule_type={rule.rule_type!r}",
-        )
+    try:
+        _validate_rule_fields(rule.rule_type, rule.threshold, rule.sigma, rule.direction)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
     await session.commit()
     await session.refresh(rule)
