@@ -5,19 +5,24 @@ import httpx
 from fastapi import FastAPI
 
 from api.routes import alerts, pairs, rules
+from cache.client import get_redis_client
 from config.settings import settings
 from providers.kraken import KrakenProvider
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        app.state.provider = KrakenProvider(
-            client,
-            base_url=settings.kraken_api_base_url,
-            requests_per_second=settings.kraken_requests_per_second,
-        )
-        yield
+    app.state.redis = get_redis_client()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            app.state.provider = KrakenProvider(
+                client,
+                base_url=settings.kraken_api_base_url,
+                requests_per_second=settings.kraken_requests_per_second,
+            )
+            yield
+    finally:
+        await app.state.redis.aclose()
 
 
 app = FastAPI(title="dropwatch", lifespan=lifespan)

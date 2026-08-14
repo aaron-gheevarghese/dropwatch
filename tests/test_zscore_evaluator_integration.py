@@ -12,9 +12,12 @@ from uuid import uuid4
 
 from db.models import AlertRule, Pair, PriceHistory, User
 from rules.evaluator import evaluate_rules_for_pair
+from workers.rule_index import RuleIndex
 
 
-async def _make_pair_and_zscore_rule(session, *, sigma: str = "2.0", direction: str | None = None) -> tuple[Pair, AlertRule]:
+async def _make_pair_and_zscore_rule(
+    session, *, sigma: str = "2.0", direction: str | None = None
+) -> tuple[Pair, AlertRule, RuleIndex]:
     user = User(contact="test@example.com")
     pair = Pair(
         kraken_pair_name=f"TESTZSCORE{uuid4().hex[:8].upper()}USD",
@@ -37,7 +40,12 @@ async def _make_pair_and_zscore_rule(session, *, sigma: str = "2.0", direction: 
     )
     session.add(rule)
     await session.flush()
-    return pair, rule
+
+    # replace_with_rules, not rebuild(): rebuild() queries via its own connection and
+    # can't see this rule, which only exists inside db_session's uncommitted transaction.
+    rule_index = RuleIndex()
+    rule_index.replace_with_rules([rule])
+    return pair, rule, rule_index
 
 
 async def _seed_history(session, pair: Pair, prices: list[float], *, start: datetime, step_seconds: int = 60) -> None:
@@ -65,7 +73,7 @@ def _calm_baseline(n: int, seed_price: float = 100.0) -> list[float]:
 
 
 async def test_current_price_is_visible_via_autoflush_and_anomaly_fires(db_session) -> None:
-    pair, rule = await _make_pair_and_zscore_rule(db_session)
+    pair, rule, rule_index = await _make_pair_and_zscore_rule(db_session)
     base = datetime(2026, 8, 15, 8, 0, 0, tzinfo=UTC)
     history = _calm_baseline(40)
     await _seed_history(db_session, pair, history, start=base)
@@ -82,14 +90,14 @@ async def test_current_price_is_visible_via_autoflush_and_anomaly_fires(db_sessi
         )
     )
 
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time)
+    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
     assert len(created) == 1
     assert created[0].type == "zscore_move"
     assert created[0].detected_price == current_price
 
 
 async def test_normal_jitter_does_not_fire(db_session) -> None:
-    pair, rule = await _make_pair_and_zscore_rule(db_session)
+    pair, rule, rule_index = await _make_pair_and_zscore_rule(db_session)
     base = datetime(2026, 8, 15, 8, 0, 0, tzinfo=UTC)
     history = _calm_baseline(40)
     await _seed_history(db_session, pair, history, start=base)
@@ -104,12 +112,12 @@ async def test_normal_jitter_does_not_fire(db_session) -> None:
             observed_at=current_time,
         )
     )
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time)
+    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
     assert created == []
 
 
 async def test_insufficient_history_never_fires_regardless_of_move_size(db_session) -> None:
-    pair, rule = await _make_pair_and_zscore_rule(db_session)
+    pair, rule, rule_index = await _make_pair_and_zscore_rule(db_session)
     base = datetime(2026, 8, 15, 8, 0, 0, tzinfo=UTC)
     history = _calm_baseline(10)  # well under the 30-observation minimum
     await _seed_history(db_session, pair, history, start=base)
@@ -123,12 +131,12 @@ async def test_insufficient_history_never_fires_regardless_of_move_size(db_sessi
             observed_at=current_time,
         )
     )
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time)
+    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
     assert created == []
 
 
 async def test_zero_variance_fallback_respects_configured_minimum_percent(db_session) -> None:
-    pair, rule = await _make_pair_and_zscore_rule(db_session)
+    pair, rule, rule_index = await _make_pair_and_zscore_rule(db_session)
     base = datetime(2026, 8, 15, 8, 0, 0, tzinfo=UTC)
     flat_history = [100.0] * 35
     await _seed_history(db_session, pair, flat_history, start=base)
@@ -142,7 +150,7 @@ async def test_zero_variance_fallback_respects_configured_minimum_percent(db_ses
             observed_at=current_time,
         )
     )
-    created_small = await evaluate_rules_for_pair(db_session, pair, small_move_price, current_time)
+    created_small = await evaluate_rules_for_pair(db_session, pair, small_move_price, current_time, rule_index)
     assert created_small == []
 
     # Above the threshold -- fires via the fallback.
@@ -154,12 +162,12 @@ async def test_zero_variance_fallback_respects_configured_minimum_percent(db_ses
             observed_at=current_time_2,
         )
     )
-    created_big = await evaluate_rules_for_pair(db_session, pair, big_move_price, current_time_2)
+    created_big = await evaluate_rules_for_pair(db_session, pair, big_move_price, current_time_2, rule_index)
     assert len(created_big) == 1
 
 
 async def test_direction_up_ignores_a_drop(db_session) -> None:
-    pair, rule = await _make_pair_and_zscore_rule(db_session, direction="up")
+    pair, rule, rule_index = await _make_pair_and_zscore_rule(db_session, direction="up")
     base = datetime(2026, 8, 15, 8, 0, 0, tzinfo=UTC)
     history = _calm_baseline(40)
     await _seed_history(db_session, pair, history, start=base)
@@ -173,12 +181,12 @@ async def test_direction_up_ignores_a_drop(db_session) -> None:
             observed_at=current_time,
         )
     )
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time)
+    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
     assert created == []
 
 
 async def test_direction_down_ignores_a_rise(db_session) -> None:
-    pair, rule = await _make_pair_and_zscore_rule(db_session, direction="down")
+    pair, rule, rule_index = await _make_pair_and_zscore_rule(db_session, direction="down")
     base = datetime(2026, 8, 15, 8, 0, 0, tzinfo=UTC)
     history = _calm_baseline(40)
     await _seed_history(db_session, pair, history, start=base)
@@ -192,5 +200,5 @@ async def test_direction_down_ignores_a_rise(db_session) -> None:
             observed_at=current_time,
         )
     )
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time)
+    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
     assert created == []

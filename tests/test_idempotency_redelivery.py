@@ -22,6 +22,7 @@ from providers.base import Quote
 from rules.evaluator import evaluate_rules_for_pair
 from scripts.setup_sqs import ensure_queues
 from workers import poller
+from workers.rule_index import RuleIndex
 
 
 class _StubProvider:
@@ -80,13 +81,16 @@ async def _cleanup_pair_and_user(pair_id, user_id) -> None:
 
 
 async def test_duplicate_poll_creates_exactly_one_notification(db_session) -> None:
-    pair, _rule, _user = await _make_pair_rule_user(db_session, threshold=Decimal("100"))
+    pair, rule, _user = await _make_pair_rule_user(db_session, threshold=Decimal("100"))
+    rule_index = RuleIndex()
+    rule_index.replace_with_rules([rule])
+
     price = Decimal("150")
     observed_at = datetime(2026, 8, 15, 12, 0, 5, tzinfo=UTC)
 
-    first = await evaluate_rules_for_pair(db_session, pair, price, observed_at)
+    first = await evaluate_rules_for_pair(db_session, pair, price, observed_at, rule_index)
     # Simulates a duplicate poll of the same underlying observation seconds later.
-    second = await evaluate_rules_for_pair(db_session, pair, price, observed_at.replace(second=40))
+    second = await evaluate_rules_for_pair(db_session, pair, price, observed_at.replace(second=40), rule_index)
 
     assert len(first) == 1
     assert len(second) == 0
@@ -113,13 +117,20 @@ async def test_true_concurrent_evaluation_creates_exactly_one_notification() -> 
         await setup_session.commit()
         pair_id, user_id = pair.id, user.id
 
+    # Rule is really committed here (unlike the db_session-fixture tests), so the real
+    # rebuild() can see it via its own connection. One shared index for both concurrent
+    # evaluations is fine — they only read it; the only mutation (last_fired_at) only
+    # happens for whichever task actually wins the notification insert race.
+    rule_index = RuleIndex()
+    await rule_index.rebuild()
+
     price = Decimal("150")
     observed_at = datetime(2026, 8, 15, 12, 5, 0, tzinfo=UTC)
 
     async def _evaluate_and_commit() -> list[Notification]:
         async with async_session_factory() as session:
             pair_row = await session.get(Pair, pair_id)
-            created = await evaluate_rules_for_pair(session, pair_row, price, observed_at)
+            created = await evaluate_rules_for_pair(session, pair_row, price, observed_at, rule_index)
             await session.commit()
             return created
 
@@ -146,6 +157,8 @@ async def test_forced_crash_then_sqs_redelivery_creates_exactly_one_notification
         canonical_name = pair.kraken_pair_name
 
     provider = _StubProvider(canonical_name, Decimal("150"))
+    rule_index = RuleIndex()
+    await rule_index.rebuild()  # rule is really committed above, so this sees it for real
 
     try:
         with mock_aws():
@@ -160,7 +173,7 @@ async def test_forced_crash_then_sqs_redelivery_creates_exactly_one_notification
             # simulates the process crashing in the gap between commit and delete_message.
             async with async_session_factory() as session:
                 with patch.object(poller, "_delete_batch", new=AsyncMock(return_value=None)):
-                    await poller.process_batch(provider, session, sqs_client, queue_url, messages)
+                    await poller.process_batch(provider, session, sqs_client, queue_url, messages, rule_index)
 
             # A received-but-undeleted message stays invisible for the full visibility
             # timeout (30s) — it doesn't just come back. Force that expiry immediately
@@ -175,7 +188,7 @@ async def test_forced_crash_then_sqs_redelivery_creates_exactly_one_notification
 
             # Redelivery: process it again for real, this time deleting on success.
             async with async_session_factory() as session:
-                await poller.process_batch(provider, session, sqs_client, queue_url, still_visible["Messages"])
+                await poller.process_batch(provider, session, sqs_client, queue_url, still_visible["Messages"], rule_index)
 
             gone = sqs_client.receive_message(QueueUrl=queue_url, MaxNumberOfMessages=1, WaitTimeSeconds=0)
             assert gone.get("Messages", []) == [], "message should be deleted after the successful redelivery"

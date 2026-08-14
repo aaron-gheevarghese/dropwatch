@@ -37,5 +37,14 @@ class Settings(BaseSettings):
     # that and it's more likely tick noise on a thin/rounding price than a real move.
     zscore_zero_variance_min_percent: Decimal = Decimal("0.5")
 
+    # Docker-on-EC2 per the PRD's architecture decision, not ElastiCache. Defaults to
+    # localhost for host-run dev workers; docker-compose.yml overrides this to the
+    # "redis" service hostname for containerized services.
+    redis_url: str = "redis://localhost:6379/0"
+    rule_index_invalidation_channel: str = "rule_index_invalidate"
+    # Pub/sub is the fast path; this is a safety net in case a worker misses a signal
+    # (e.g. briefly disconnected from Redis) — not a substitute for it.
+    rule_index_refresh_interval_seconds: int = 300
+
 
 settings = Settings()

@@ -4,6 +4,19 @@ OutboxEvent rows in the same transaction as the PriceHistory write that triggere
 absolute_below/absolute_above/zscore_move are implemented — percent_change and
 spread_widen remain Step 7.
 
+Rules come from the in-memory RuleIndex (workers/rule_index.py), not a per-pair DB
+query — that's Step 6's whole point. Rule objects in the index were loaded by a
+different, now-closed session, so they're SQLAlchemy-detached: reading their columns
+(threshold, sigma, rule_type, id, ...) is fine, they're already loaded in memory, but
+mutating an attribute and expecting a later session.commit() to notice is not — a
+detached object's changes aren't tracked by any session. last_fired_at is therefore
+updated two ways: mutated directly on the in-memory object (so the index's own cooldown
+check stays correct for later evaluations in this same process, without waiting for a
+rebuild) AND written to Postgres via a targeted UPDATE by id (durable, visible to other
+processes and a future GET /rules). Note the index can lag a brand-new rule by however
+long invalidation takes to propagate — an accepted eventual-consistency window, not a
+bug; see workers/rule_index.py.
+
 Two independent guards apply, in order:
 
 1. Idempotency: the SAME detected state (same rule, same pair, same price, same minute)
@@ -25,15 +38,15 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.settings import settings
 from db.models import AlertRule, Notification, OutboxEvent, Pair, PriceHistory
+from workers.rule_index import RuleIndex
 from workers.zscore_filter import ZScoreResult, compute_zscore
 
-IMPLEMENTED_RULE_TYPES = ("absolute_below", "absolute_above", "zscore_move")
 STATUS_PENDING = "pending"
 STATUS_SUPPRESSED_COOLDOWN = "suppressed_cooldown"
 
@@ -143,45 +156,46 @@ def _in_cooldown(rule: AlertRule, observed_at: datetime) -> bool:
     return elapsed < rule.cooldown_seconds
 
 
+def _matching_absolute_rules(rules: list[AlertRule], price: Decimal) -> list[AlertRule]:
+    # Sorted so that the moment one rule fails to fire, every remaining rule in this
+    # bucket is guaranteed to fail too (see workers/rule_index.py) — stop right there
+    # instead of checking the rest.
+    matched = []
+    for rule in rules:
+        if not rule_fires(rule, price):
+            break
+        matched.append(rule)
+    return matched
+
+
 async def evaluate_rules_for_pair(
-    session: AsyncSession, pair: Pair, price: Decimal, observed_at: datetime
+    session: AsyncSession, pair: Pair, price: Decimal, observed_at: datetime, rule_index: RuleIndex
 ) -> list[Notification]:
     """Fires any absolute_below/absolute_above/zscore_move rule for this pair that the
     given price qualifies for. Returns the Notifications actually created — delivered
     or suppressed — empty if nothing fired or everything was a duplicate of an
     already-recorded detected state.
     """
-    result = await session.execute(
-        select(AlertRule).where(
-            AlertRule.pair_id == pair.id,
-            AlertRule.is_enabled.is_(True),
-            AlertRule.rule_type.in_(IMPLEMENTED_RULE_TYPES),
+    pair_rules = rule_index.rules_for_pair(pair.id)
+
+    candidates: list[AlertRule] = _matching_absolute_rules(pair_rules.absolute_below, price)
+    candidates += _matching_absolute_rules(pair_rules.absolute_above, price)
+
+    zscore_result: ZScoreResult | None = None
+    if pair_rules.zscore_move:
+        prices = await _fetch_recent_prices(session, pair, settings.zscore_window + 2)
+        zscore_result = compute_zscore(
+            prices, window=settings.zscore_window, min_observations=settings.zscore_min_observations
         )
-    )
-    rules = result.scalars().all()
+        candidates += [
+            rule
+            for rule in pair_rules.zscore_move
+            if zscore_rule_fires(rule, zscore_result, settings.zscore_zero_variance_min_percent)
+        ]
 
     created: list[Notification] = []
 
-    # Computed at most once per pair evaluation, lazily — only if some rule needs it —
-    # and shared across every zscore_move rule for this pair rather than refetched per rule.
-    zscore_result: ZScoreResult | None = None
-    zscore_computed = False
-
-    for rule in rules:
-        if rule.rule_type == "zscore_move":
-            if not zscore_computed:
-                prices = await _fetch_recent_prices(session, pair, settings.zscore_window + 2)
-                zscore_result = compute_zscore(
-                    prices, window=settings.zscore_window, min_observations=settings.zscore_min_observations
-                )
-                zscore_computed = True
-            fires = zscore_rule_fires(rule, zscore_result, settings.zscore_zero_variance_min_percent)
-        else:
-            fires = rule_fires(rule, price)
-
-        if not fires:
-            continue
-
+    for rule in candidates:
         state_hash = compute_detected_state_hash(rule, price, observed_at)
         idempotency_key = compute_idempotency_key(rule.id, pair.id, state_hash)
 
@@ -234,8 +248,13 @@ async def evaluate_rules_for_pair(
             session.add(OutboxEvent(notification_id=notification.id, payload=payload))
 
         # Advances on every fire, delivered or suppressed, so the cooldown window
-        # slides from the most recent qualifying observation.
+        # slides from the most recent qualifying observation. rule is detached (loaded
+        # by the index's own session, not this one), so a plain attribute mutation
+        # alone would never be flushed — mutate the in-memory copy (keeps this
+        # process's cooldown checks correct immediately) AND write it through
+        # explicitly by id (durable, visible to other processes and the DB directly).
         rule.last_fired_at = observed_at
+        await session.execute(update(AlertRule).where(AlertRule.id == rule.id).values(last_fired_at=observed_at))
         created.append(notification)
 
     return created

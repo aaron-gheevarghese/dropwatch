@@ -1,4 +1,10 @@
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"  # also reachable as localhost:6379 from host-run dev workers
+    restart: unless-stopped
+
   scheduler:
     build: .
     command: python -m workers.scheduler
@@ -11,6 +17,12 @@ services:
     command: python -m workers.poller
     env_file:
       - .env
+    environment:
+      # Only poller uses Redis (rule index invalidation) — override the .env default
+      # (meant for host-run dev) to the compose network's service hostname.
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
     restart: unless-stopped
 
   outbox_publisher:

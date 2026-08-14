@@ -7,14 +7,15 @@ suppression (no alert spam during a sustained move).
 
 ## Architecture
 
-Five long-running processes, one Postgres database, one SQS queue pair, one SNS topic:
+Five long-running processes, one Postgres database, one SQS queue pair, one SNS topic,
+one Redis instance:
 
 | Process | Does |
 | --- | --- |
 | `api` (FastAPI) | `POST/GET /pairs`, `POST/PATCH /rules`, `GET /alerts` |
 | `workers/discovery.py` | Daily job. Scans all Kraken USD pairs, tracks/untracks by a $100k/$75k notional-volume hysteresis floor |
 | `workers/scheduler.py` | Every 5s, enqueues one staggered SQS message per pair that's due for a poll |
-| `workers/poller.py` | SQS consumer. Batches due pairs into one Kraken `Ticker` call, writes `PriceHistory`, evaluates alert rules, commits — deletes the SQS message only on success |
+| `workers/poller.py` | SQS consumer. Batches due pairs into one Kraken `Ticker` call, writes `PriceHistory`, evaluates alert rules against an in-memory rule index, commits — deletes the SQS message only on success |
 | `workers/outbox_publisher.py` | Polls pending `OutboxEvent` rows and publishes them to SNS, with exponential backoff on failure |
 
 Data flow: `discovery` decides what's tracked → `scheduler` decides when to poll it →
@@ -27,6 +28,9 @@ Rule evaluation (`rules/evaluator.py`) supports three rule types: `absolute_belo
 `absolute_above` (fixed threshold) and `zscore_move` (statistical: fires when a price's
 log return is an outlier relative to that pair's own recent rolling volatility, not a
 fixed percentage — see `workers/zscore_filter.py` and the measurement note below).
+Rules come from `workers/rule_index.py`, an in-memory index bucketed by pair and
+pre-sorted so evaluation short-circuits instead of scanning every rule — see
+[Rule index](#rule-index) below for why and by how much.
 
 ```
 Kraken API
@@ -38,9 +42,9 @@ discovery.py ──► pairs (Postgres)
 scheduler.py ──► SQS poll queue ──► poller.py ──► price_history (Postgres)
                        │                │              │
                        ▼                │              ▼
-                   SQS DLQ  ◄───────────┘        rules/evaluator.py
-                (after 5 failed                        │
-                 receives)                              ▼
+                   SQS DLQ  ◄───────────┘   rule_index.py (in-memory) ◄── Redis pub/sub
+                (after 5 failed                        │                  (POST/PATCH /rules
+                 receives)                              ▼                  invalidates)
                                           notifications + outbox_events
                                                          │
                                                          ▼
@@ -54,6 +58,9 @@ scheduler.py ──► SQS poll queue ──► poller.py ──► price_histor
 - AWS credentials with SQS + SNS permissions — either a local AWS CLI profile (dev) or
   an EC2 instance role (deployment). No static keys are read from `.env`; boto3's
   default credential chain handles this.
+- Redis, reachable at `REDIS_URL` — run via `docker compose up redis` or any local
+  install. Docker-on-EC2 in deployment, not ElastiCache (a deliberate architecture
+  choice, not a cost shortcut waiting to be fixed).
 
 ## Setup
 
@@ -116,11 +123,13 @@ python -m workers.discovery  # one-shot; intended to run on a daily schedule
 docker compose up --build
 ```
 
-Brings up `scheduler`, `poller`, and `outbox_publisher` as three services from one
-image. Run the setup scripts (migrations, `setup_sqs`, `setup_sns`, `seed_user`) once
-beforehand — they're deliberately not part of the compose stack, since they're one-off
-provisioning steps, not long-running processes. The API isn't in `docker-compose.yml`
-yet either; run it locally or add a service for it the same way.
+Brings up `redis`, `scheduler`, `poller`, and `outbox_publisher` — `poller` is the only
+service that actually depends on `redis` (rule index invalidation); the others don't
+need it and don't wait on it. Run the setup scripts (migrations, `setup_sqs`,
+`setup_sns`, `seed_user`) once beforehand — they're deliberately not part of the
+compose stack, since they're one-off provisioning steps, not long-running processes.
+The API isn't in `docker-compose.yml` yet either; run it locally or add a service for
+it the same way (it'll need `REDIS_URL` too, to publish rule-change invalidations).
 
 ## Environment variables
 
@@ -144,6 +153,9 @@ yet either; run it locally or add a service for it the same way.
 | `ZSCORE_WINDOW` | no | `60` | Rolling baseline size (prior returns) for `zscore_move` |
 | `ZSCORE_MIN_OBSERVATIONS` | no | `30` | Minimum prior returns required before a `zscore_move` rule can fire at all |
 | `ZSCORE_ZERO_VARIANCE_MIN_PERCENT` | no | `0.5` | Fallback minimum percent move required to fire when the baseline window has zero variance (division by zero otherwise) |
+| `REDIS_URL` | no | `redis://localhost:6379/0` | Rule index invalidation pub/sub. `docker-compose.yml` overrides this to `redis://redis:6379/0` for the containerized poller |
+| `RULE_INDEX_INVALIDATION_CHANNEL` | no | `rule_index_invalidate` | Pub/sub channel `POST`/`PATCH /rules` publish to and the poller subscribes to |
+| `RULE_INDEX_REFRESH_INTERVAL_SECONDS` | no | `300` | Periodic safety-net rebuild in case a worker misses a pub/sub signal (e.g. briefly disconnected from Redis) — not a substitute for it |
 
 ## API
 
@@ -176,17 +188,46 @@ realistic thresholds, because a 2-sigma cutoff has a fixed ~4.55%+ theoretical f
 rate that a fixed percentage threshold isn't bound by. No specific percentage from
 that report should be quoted out of context.
 
+## Rule index
+
+`workers/rule_index.py` keeps AlertRules in memory, bucketed by pair, instead of the
+poller running one DB query per pair per poll cycle. Within a bucket, `absolute_below`
+is sorted descending by threshold and `absolute_above` ascending, so evaluation stops
+at the first non-matching rule instead of scanning the rest — see the module's
+docstring for why the sort order guarantees that's safe. `zscore_move` has no such
+ordering (firing depends on sigma/direction against one shared per-pair z-score, and
+checking that is O(1) regardless of order) so it's just a small unsorted list.
+
+Freshness: built from Postgres on worker start (blocking — the poller won't process
+messages against an empty index), kept fresh via Redis pub/sub (`POST`/`PATCH /rules`
+publish, the poller subscribes and rebuilds on signal), plus a periodic fallback
+rebuild as a safety net if a signal is ever missed. A rebuild is atomic from a reader's
+perspective — built fully off to the side, then swapped in with one reference
+assignment.
+
+**Measured, not asserted** — `python -m scripts.benchmark_rule_index` seeds ~120
+synthetic pairs and up to 400 rules/pair (the PRD's own example scale) into real
+Postgres, times the naive per-pair query against the live Supabase pooler, times the
+indexed lookup+scan, and writes `docs/rule_index_benchmark_report.md`. Measured result
+at the worst-case scale: **~228x faster per poll cycle** (5175ms naive vs 22.7ms
+indexed for 120 pairs), growing to ~3330x at a lighter, still-realistic 10 rules/pair.
+As expected and stated up front in the report's methodology, this is dominated by
+eliminating a network round-trip per pair, not by algorithmic cleverness — Postgres
+itself scans even 400 rows in sub-millisecond CPU time; the point of the index is never
+making that round-trip at all.
+
 ## Testing
 
 ```bash
 python -m pytest
 ```
 
-Most tests are fully mocked (Kraken via `respx`, AWS via `moto`) and need no live
-services. A subset — idempotency/redelivery races and cooldown suppression — run
-against the real (dev) Supabase database, wrapped in a transaction that's rolled back
-after each test (see `tests/conftest.py`); nothing they do is ever actually committed.
-This needs a working `DATABASE_URL` in `.env` to run.
+Most tests are fully mocked (Kraken via `respx`, AWS via `moto`, Redis via `fakeredis`
+— an in-memory server, same role as `moto` but for Redis) and need no live services. A
+subset — idempotency/redelivery races and cooldown suppression — run against the real
+(dev) Supabase database, wrapped in a transaction that's rolled back after each test
+(see `tests/conftest.py`); nothing they do is ever actually committed. This needs a
+working `DATABASE_URL` in `.env` to run.
 
 ## Build status
 
@@ -206,10 +247,16 @@ This needs a working `DATABASE_URL` in `.env` to run.
   substantiated value proposition; the literal "% fewer false positives than one fixed
   threshold" framing turned out to be threshold-dependent and often unfavorable at
   realistic thresholds. Full writeup in `docs/zscore_measurement_report.md`.
+- **Step 6 — Rule index and benchmark:** in-memory rule index bucketed by pair,
+  sorted for short-circuit evaluation; Redis (Docker-on-EC2, not ElastiCache) added for
+  pub/sub invalidation with a periodic safety-net rebuild; poller wired to the index
+  instead of a per-pair DB query. Done — see [Rule index](#rule-index) above. Measured
+  ~228x per-poll-cycle speedup at the PRD's 400-rules/pair worst case, real Postgres
+  timings, not assumed. Full writeup in `docs/rule_index_benchmark_report.md`.
 - **Not yet built:**
   - EC2 deploy (currently runs from a laptop/dev machine only)
   - `percent_change`, `spread_widen` rule types (Step 7)
-  - Indexed/batched rule evaluation — currently a naive per-pair scan (Step 6)
   - Load testing at the 500+ pairs/minute target
   - A way to discover the seeded user's ID via the API (currently: check the DB or
     the seed script's log output)
+  - The API service isn't in `docker-compose.yml` (only the four background workers are)

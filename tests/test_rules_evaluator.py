@@ -9,7 +9,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from db.models import AlertRule
-from rules.evaluator import compute_detected_state_hash, compute_idempotency_key, rule_fires
+from rules.evaluator import _matching_absolute_rules, compute_detected_state_hash, compute_idempotency_key, rule_fires
 
 
 def _make_rule(rule_type: str, threshold: str | None = "100") -> AlertRule:
@@ -84,6 +84,49 @@ def test_hash_differs_for_different_price() -> None:
     second = compute_detected_state_hash(rule, Decimal("94"), observed_at)
 
     assert first != second
+
+
+def test_matching_absolute_below_stops_at_first_non_match() -> None:
+    # Sorted descending, as workers/rule_index.py guarantees. price=80 should match the
+    # 100 and 90 thresholds (80 < both) but not 70 (80 >= 70) — and must stop there,
+    # never even looking at 50, proving the short-circuit actually short-circuits.
+    pair_id = uuid4()
+    rules = [
+        AlertRule(id=uuid4(), user_id=uuid4(), pair_id=pair_id, rule_type="absolute_below", threshold=Decimal(t))
+        for t in ("100", "90", "70", "50")
+    ]
+    matched = _matching_absolute_rules(rules, Decimal("80"))
+    assert [r.threshold for r in matched] == [Decimal("100"), Decimal("90")]
+
+
+def test_matching_absolute_above_stops_at_first_non_match() -> None:
+    # Sorted ascending. price=120 matches 50 and 100 (120 > both) but not 150.
+    pair_id = uuid4()
+    rules = [
+        AlertRule(id=uuid4(), user_id=uuid4(), pair_id=pair_id, rule_type="absolute_above", threshold=Decimal(t))
+        for t in ("50", "100", "150", "200")
+    ]
+    matched = _matching_absolute_rules(rules, Decimal("120"))
+    assert [r.threshold for r in matched] == [Decimal("50"), Decimal("100")]
+
+
+def test_matching_absolute_rules_none_match() -> None:
+    pair_id = uuid4()
+    rules = [
+        AlertRule(id=uuid4(), user_id=uuid4(), pair_id=pair_id, rule_type="absolute_below", threshold=Decimal(t))
+        for t in ("100", "90")
+    ]
+    assert _matching_absolute_rules(rules, Decimal("200")) == []
+
+
+def test_matching_absolute_rules_all_match() -> None:
+    pair_id = uuid4()
+    rules = [
+        AlertRule(id=uuid4(), user_id=uuid4(), pair_id=pair_id, rule_type="absolute_below", threshold=Decimal(t))
+        for t in ("100", "90", "50")
+    ]
+    matched = _matching_absolute_rules(rules, Decimal("10"))
+    assert len(matched) == 3
 
 
 def test_idempotency_key_deterministic_and_scoped_to_rule_and_pair() -> None:

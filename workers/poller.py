@@ -6,9 +6,10 @@ set up by scripts/setup_sqs.py moves it to the DLQ automatically. Still no
 interpolation: a pair that fails, or that Kraken simply omits from the response, is
 left alone rather than written with a guessed value.
 
-After each successful PriceHistory write, absolute_below/absolute_above rules for that
-pair are evaluated in the same transaction (rules/evaluator.py) — a qualifying rule
-creates a Notification + OutboxEvent that commits atomically with the observation itself.
+After each successful PriceHistory write, rules for that pair are evaluated (in the
+same transaction) against the in-memory RuleIndex (workers/rule_index.py) rather than a
+per-pair DB query — a qualifying rule creates a Notification + OutboxEvent that commits
+atomically with the observation itself.
 """
 
 import asyncio
@@ -21,6 +22,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cache.client import get_redis_client
 from config.settings import settings
 from db.client import async_session_factory
 from db.models import Pair, PriceHistory
@@ -28,6 +30,7 @@ from providers.base import MarketDataProvider
 from providers.kraken import KrakenProvider
 from rules.evaluator import evaluate_rules_for_pair
 from sqs.client import get_queue_url, get_sqs_client
+from workers.rule_index import RuleIndex, keep_index_fresh
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +69,7 @@ async def process_batch(
     sqs_client,
     queue_url: str,
     messages: list[dict],
+    rule_index: RuleIndex,
 ) -> None:
     by_pair_id: dict[UUID, dict] = {}
     for message in messages:
@@ -130,13 +134,13 @@ async def process_batch(
         pair.last_checked_at = observed_at
         to_delete.append(message)
 
-        await evaluate_rules_for_pair(session, pair, quote.last, observed_at)
+        await evaluate_rules_for_pair(session, pair, quote.last, observed_at, rule_index)
 
     await session.commit()
     await _delete_batch(sqs_client, queue_url, to_delete)
 
 
-async def run_forever(provider: MarketDataProvider) -> None:
+async def run_forever(provider: MarketDataProvider, rule_index: RuleIndex) -> None:
     sqs_client = get_sqs_client()
     queue_url = await asyncio.to_thread(get_queue_url, sqs_client, settings.sqs_poll_queue_name)
 
@@ -147,7 +151,7 @@ async def run_forever(provider: MarketDataProvider) -> None:
 
         async with async_session_factory() as session:
             try:
-                await process_batch(provider, session, sqs_client, queue_url, messages)
+                await process_batch(provider, session, sqs_client, queue_url, messages, rule_index)
             except Exception:
                 logger.exception("poll batch processing failed")
 
@@ -155,13 +159,26 @@ async def run_forever(provider: MarketDataProvider) -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        provider = KrakenProvider(
-            client,
-            base_url=settings.kraken_api_base_url,
-            requests_per_second=settings.kraken_requests_per_second,
-        )
-        await run_forever(provider)
+    rule_index = RuleIndex()
+    # Must complete before any message is processed — otherwise evaluate_rules_for_pair
+    # would silently see an empty index for however long the first build takes.
+    count = await rule_index.rebuild()
+    logger.info("rule index ready: %d rules", count)
+
+    redis_client = get_redis_client()
+    index_sync_task = asyncio.create_task(keep_index_fresh(rule_index, redis_client))
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            provider = KrakenProvider(
+                client,
+                base_url=settings.kraken_api_base_url,
+                requests_per_second=settings.kraken_requests_per_second,
+            )
+            await run_forever(provider, rule_index)
+    finally:
+        index_sync_task.cancel()
+        await redis_client.aclose()
 
 
 if __name__ == "__main__":

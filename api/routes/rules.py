@@ -1,16 +1,35 @@
+import logging
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config.settings import settings
 from db.client import get_session
 from db.models import AlertRule, Pair, User
-from rules.evaluator import IMPLEMENTED_RULE_TYPES
+from rules.rule_types import IMPLEMENTED_RULE_TYPES
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/rules", tags=["rules"])
+
+
+async def get_redis(request: Request):
+    return request.app.state.redis
+
+
+async def _publish_invalidation(redis_client) -> None:
+    # Best-effort: the rule write already committed to Postgres (source of truth) by
+    # the time this runs. If Redis is unreachable, workers still pick this up via their
+    # periodic safety-net refresh (workers/rule_index.py) — just not instantly. Don't
+    # fail the request over a cache-invalidation hiccup.
+    try:
+        await redis_client.publish(settings.rule_index_invalidation_channel, "invalidate")
+    except Exception:
+        logger.exception("failed to publish rule index invalidation; workers will pick this up on their next periodic refresh")
 
 ZSCORE_DIRECTIONS = ("up", "down", "both")
 
@@ -88,6 +107,7 @@ class RuleResponse(BaseModel):
 async def create_rule(
     body: CreateRuleRequest,
     session: AsyncSession = Depends(get_session),
+    redis_client=Depends(get_redis),
 ) -> AlertRule:
     pair = await session.get(Pair, body.pair_id)
     if pair is None:
@@ -112,6 +132,7 @@ async def create_rule(
     session.add(rule)
     await session.commit()
     await session.refresh(rule)
+    await _publish_invalidation(redis_client)
     return rule
 
 
@@ -120,6 +141,7 @@ async def update_rule(
     rule_id: UUID,
     body: UpdateRuleRequest,
     session: AsyncSession = Depends(get_session),
+    redis_client=Depends(get_redis),
 ) -> AlertRule:
     rule = await session.get(AlertRule, rule_id)
     if rule is None:
@@ -135,4 +157,5 @@ async def update_rule(
 
     await session.commit()
     await session.refresh(rule)
+    await _publish_invalidation(redis_client)
     return rule

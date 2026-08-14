@@ -10,11 +10,12 @@ from sqlalchemy import select
 
 from db.models import AlertRule, Notification, OutboxEvent, Pair, User
 from rules.evaluator import STATUS_PENDING, STATUS_SUPPRESSED_COOLDOWN, evaluate_rules_for_pair
+from workers.rule_index import RuleIndex
 
 COOLDOWN_SECONDS = 300
 
 
-async def _make_pair_and_cooldown_rule(session) -> tuple[Pair, AlertRule]:
+async def _make_pair_and_cooldown_rule(session) -> tuple[Pair, AlertRule, RuleIndex]:
     user = User(contact="test@example.com")
     pair = Pair(
         kraken_pair_name="TESTCOOLDOWNUSD",
@@ -37,11 +38,16 @@ async def _make_pair_and_cooldown_rule(session) -> tuple[Pair, AlertRule]:
     )
     session.add(rule)
     await session.flush()
-    return pair, rule
+
+    # replace_with_rules, not rebuild(): rebuild() queries via its own connection and
+    # can't see this rule, which only exists inside db_session's uncommitted transaction.
+    rule_index = RuleIndex()
+    rule_index.replace_with_rules([rule])
+    return pair, rule, rule_index
 
 
 async def test_sustained_move_delivers_once_and_suppresses_the_rest(db_session) -> None:
-    pair, rule = await _make_pair_and_cooldown_rule(db_session)
+    pair, rule, rule_index = await _make_pair_and_cooldown_rule(db_session)
     base = datetime(2026, 8, 15, 9, 0, 0, tzinfo=UTC)
 
     # A sustained drop: each price is different (so idempotency doesn't dedup them —
@@ -53,7 +59,7 @@ async def test_sustained_move_delivers_once_and_suppresses_the_rest(db_session) 
     fired: list[Notification] = []
     for price, offset in zip(prices, offsets, strict=True):
         observed_at = base + timedelta(seconds=offset)
-        created = await evaluate_rules_for_pair(db_session, pair, price, observed_at)
+        created = await evaluate_rules_for_pair(db_session, pair, price, observed_at, rule_index)
         assert len(created) == 1
         fired.append(created[0])
 
@@ -88,7 +94,7 @@ async def test_sustained_move_delivers_once_and_suppresses_the_rest(db_session) 
     # Past the cooldown window measured from the LAST fire (t0+120s), a new qualifying
     # move should deliver again.
     past_cooldown = base + timedelta(seconds=120 + COOLDOWN_SECONDS + 1)
-    resumed = await evaluate_rules_for_pair(db_session, pair, Decimal("850"), past_cooldown)
+    resumed = await evaluate_rules_for_pair(db_session, pair, Decimal("850"), past_cooldown, rule_index)
     assert len(resumed) == 1
     assert resumed[0].status == STATUS_PENDING
 
@@ -101,8 +107,10 @@ async def test_sustained_move_delivers_once_and_suppresses_the_rest(db_session) 
 
 
 async def test_first_ever_fire_is_never_suppressed(db_session) -> None:
-    pair, _rule = await _make_pair_and_cooldown_rule(db_session)
-    created = await evaluate_rules_for_pair(db_session, pair, Decimal("900"), datetime(2026, 8, 15, 9, 0, 0, tzinfo=UTC))
+    pair, _rule, rule_index = await _make_pair_and_cooldown_rule(db_session)
+    created = await evaluate_rules_for_pair(
+        db_session, pair, Decimal("900"), datetime(2026, 8, 15, 9, 0, 0, tzinfo=UTC), rule_index
+    )
     assert len(created) == 1
     assert created[0].status == STATUS_PENDING
 
@@ -131,9 +139,12 @@ async def test_zero_cooldown_never_suppresses(db_session) -> None:
     db_session.add(rule)
     await db_session.flush()
 
+    rule_index = RuleIndex()
+    rule_index.replace_with_rules([rule])
+
     base = datetime(2026, 8, 15, 9, 0, 0, tzinfo=UTC)
-    first = await evaluate_rules_for_pair(db_session, pair, Decimal("900"), base)
-    second = await evaluate_rules_for_pair(db_session, pair, Decimal("899"), base + timedelta(seconds=1))
+    first = await evaluate_rules_for_pair(db_session, pair, Decimal("900"), base, rule_index)
+    second = await evaluate_rules_for_pair(db_session, pair, Decimal("899"), base + timedelta(seconds=1), rule_index)
 
     assert first[0].status == STATUS_PENDING
     assert second[0].status == STATUS_PENDING
