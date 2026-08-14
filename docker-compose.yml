@@ -12,3 +12,10 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+
+  outbox_publisher:
+    build: .
+    command: python -m workers.outbox_publisher
+    env_file:
+      - .env
+    restart: unless-stopped

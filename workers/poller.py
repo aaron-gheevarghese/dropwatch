@@ -5,6 +5,10 @@ timeout and gets redelivered — after sqs_max_receive_count receives, the redri
 set up by scripts/setup_sqs.py moves it to the DLQ automatically. Still no
 interpolation: a pair that fails, or that Kraken simply omits from the response, is
 left alone rather than written with a guessed value.
+
+After each successful PriceHistory write, absolute_below/absolute_above rules for that
+pair are evaluated in the same transaction (rules/evaluator.py) — a qualifying rule
+creates a Notification + OutboxEvent that commits atomically with the observation itself.
 """
 
 import asyncio
@@ -22,6 +26,7 @@ from db.client import async_session_factory
 from db.models import Pair, PriceHistory
 from providers.base import MarketDataProvider
 from providers.kraken import KrakenProvider
+from rules.evaluator import evaluate_rules_for_pair
 from sqs.client import get_queue_url, get_sqs_client
 
 logger = logging.getLogger(__name__)
@@ -124,6 +129,8 @@ async def process_batch(
         pair.current_ask_price = quote.ask
         pair.last_checked_at = observed_at
         to_delete.append(message)
+
+        await evaluate_rules_for_pair(session, pair, quote.last, observed_at)
 
     await session.commit()
     await _delete_batch(sqs_client, queue_url, to_delete)

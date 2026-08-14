@@ -24,5 +24,11 @@ class Settings(BaseSettings):
     sqs_visibility_timeout_seconds: int = 30
     sqs_max_receive_count: int = 5
 
+    sns_topic_name: str = "dropwatch-alerts"
+    alert_email: str = "aaron123iseragon@gmail.com"
+
+    outbox_backoff_base_seconds: int = 5
+    outbox_backoff_max_seconds: int = 300
+
 
 settings = Settings()
