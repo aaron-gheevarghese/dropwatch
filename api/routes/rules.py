@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.client import get_session
-from db.models import AlertRule, Pair
+from db.models import AlertRule, Pair, User
 from rules.evaluator import IMPLEMENTED_RULE_TYPES
 
 router = APIRouter(prefix="/rules", tags=["rules"])
@@ -63,6 +63,10 @@ async def create_rule(
     pair = await session.get(Pair, body.pair_id)
     if pair is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"pair {body.pair_id} not found")
+
+    user = await session.get(User, body.user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"user {body.user_id} not found")
 
     rule = AlertRule(
         user_id=body.user_id,

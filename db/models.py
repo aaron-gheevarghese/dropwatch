@@ -62,15 +62,28 @@ class PriceHistory(Base):
     pair: Mapped["Pair"] = relationship(back_populates="price_history")
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # v1 is single-user: exactly one row, seeded by scripts/seed_user.py. This table
+    # exists so the fan-out path (AlertRule.user_id -> User) is real now rather than a
+    # bare UUID with nothing behind it, even though delivery is still one shared SNS
+    # email subscription, not per-user routed.
+    contact: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+    alert_rules: Mapped[list["AlertRule"]] = relationship(back_populates="user")
+
+
 class AlertRule(Base):
     __tablename__ = "alert_rules"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    # No users table exists yet anywhere in this project — plain UUID, no FK. Delivery
-    # is a single shared SNS email subscription for now, so this isn't consulted for
-    # per-user routing yet; it's a forward-compatible identifying field.
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     pair_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("pairs.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -95,6 +108,7 @@ class AlertRule(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
+    user: Mapped["User"] = relationship(back_populates="alert_rules")
     pair: Mapped["Pair"] = relationship()
     notifications: Mapped[list["Notification"]] = relationship(back_populates="rule", cascade="all, delete-orphan")
 
