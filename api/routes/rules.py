@@ -21,15 +21,43 @@ async def get_redis(request: Request):
     return request.app.state.redis
 
 
-async def _publish_invalidation(redis_client) -> None:
+async def _publish_invalidation(redis_client, reason: str) -> None:
     # Best-effort: the rule write already committed to Postgres (source of truth) by
     # the time this runs. If Redis is unreachable, workers still pick this up via their
     # periodic safety-net refresh (workers/rule_index.py) — just not instantly. Don't
     # fail the request over a cache-invalidation hiccup.
+    channel = settings.rule_index_invalidation_channel
+    logger.info("rule index: publishing invalidation on %r (%s)", channel, reason)
     try:
-        await redis_client.publish(settings.rule_index_invalidation_channel, "invalidate")
+        subscriber_count = await redis_client.publish(channel, "invalidate")
     except Exception:
-        logger.exception("failed to publish rule index invalidation; workers will pick this up on their next periodic refresh")
+        logger.exception(
+            "rule index: failed to publish invalidation on %r (%s); "
+            "workers will pick this up on their next periodic refresh",
+            channel,
+            reason,
+        )
+        return
+
+    # publish() returning 0 means Redis accepted the command but NO worker was
+    # subscribed at that instant — a strong signal something's wrong with the
+    # subscriber side (not connected, crashed, wrong channel/URL) even though this
+    # publish call itself "succeeded". Not an error here (nothing to retry — Redis
+    # pub/sub doesn't queue for absent subscribers), but very much worth knowing.
+    if subscriber_count == 0:
+        logger.warning(
+            "rule index: published invalidation on %r (%s) but 0 subscribers received it — "
+            "no worker appears to be listening right now",
+            channel,
+            reason,
+        )
+    else:
+        logger.info(
+            "rule index: invalidation on %r (%s) delivered to %d subscriber(s)",
+            channel,
+            reason,
+            subscriber_count,
+        )
 
 ZSCORE_DIRECTIONS = ("up", "down", "both")
 
@@ -132,7 +160,7 @@ async def create_rule(
     session.add(rule)
     await session.commit()
     await session.refresh(rule)
-    await _publish_invalidation(redis_client)
+    await _publish_invalidation(redis_client, reason=f"rule {rule.id} created")
     return rule
 
 
@@ -157,5 +185,5 @@ async def update_rule(
 
     await session.commit()
     await session.refresh(rule)
-    await _publish_invalidation(redis_client)
+    await _publish_invalidation(redis_client, reason=f"rule {rule.id} updated")
     return rule

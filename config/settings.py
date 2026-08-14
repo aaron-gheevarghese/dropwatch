@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # Pub/sub is the fast path; this is a safety net in case a worker misses a signal
     # (e.g. briefly disconnected from Redis) — not a substitute for it.
     rule_index_refresh_interval_seconds: int = 300
+    # Without this, a pub/sub connection silently dropped by NAT/Docker networking
+    # during an idle period is never detected — redis-py's PING health check only runs
+    # if this is set AND the read path gives it a chance to (see cache/client.py and
+    # workers/rule_index.py's _listen_for_invalidations).
+    redis_health_check_interval_seconds: int = 30
 
 
 settings = Settings()

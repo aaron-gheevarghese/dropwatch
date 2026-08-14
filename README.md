@@ -156,6 +156,7 @@ it the same way (it'll need `REDIS_URL` too, to publish rule-change invalidation
 | `REDIS_URL` | no | `redis://localhost:6379/0` | Rule index invalidation pub/sub. `docker-compose.yml` overrides this to `redis://redis:6379/0` for the containerized poller |
 | `RULE_INDEX_INVALIDATION_CHANNEL` | no | `rule_index_invalidate` | Pub/sub channel `POST`/`PATCH /rules` publish to and the poller subscribes to |
 | `RULE_INDEX_REFRESH_INTERVAL_SECONDS` | no | `300` | Periodic safety-net rebuild in case a worker misses a pub/sub signal (e.g. briefly disconnected from Redis) — not a substitute for it |
+| `REDIS_HEALTH_CHECK_INTERVAL_SECONDS` | no | `30` | How often redis-py PINGs an idle pub/sub connection to detect a silently-dead one (see the post-Step-6 fix note under [Rule index](#rule-index)) |
 
 ## API
 
@@ -204,6 +205,26 @@ publish, the poller subscribes and rebuilds on signal), plus a periodic fallback
 rebuild as a safety net if a signal is ever missed. A rebuild is atomic from a reader's
 perspective — built fully off to the side, then swapped in with one reference
 assignment.
+
+**Post-Step-6 fix:** pub/sub invalidation worked in every test (including against a
+real local Redis) but silently stopped working on the deployed EC2 instance after some
+idle time. Root cause: the listener used `pubsub.listen()`, which does one *unbounded*
+blocking read per message — and redis-py's connection health-check PING only gets a
+chance to run at the start of a read call, so a single unbounded read blocks that check
+out entirely. If the underlying TCP connection is silently dropped (NAT/Docker
+networking dropping an idle connection with no FIN/RST — common in cloud networking,
+and never reproducible against `fakeredis`, which has no real TCP layer to go stale
+on), `listen()` just hangs forever: no exception, no log line, nothing. Fixed by (1)
+enabling `health_check_interval` on the client (`cache/client.py`, disabled by default)
+and (2) switching the listener to `pubsub.get_message(timeout=...)` polling
+(`workers/rule_index.py`), which returns on its own on a schedule and gives the health
+check real opportunities to fire and detect a truly dead connection. Verified against a
+real local Redis server: confirmed periodic health-check `PING`s actually go out on the
+wire while idle, and confirmed the listener detects a killed/restarted Redis process
+and reconnects. Also added: logging around both the publish (`api/routes/rules.py` —
+notably, `publish()`'s return value tells you how many subscribers were listening at
+that instant, which is 0 if no worker was connected) and the subscribe/receive loop, so
+this class of issue is observable next time instead of silent.
 
 **Measured, not asserted** — `python -m scripts.benchmark_rule_index` seeds ~120
 synthetic pairs and up to 400 rules/pair (the PRD's own example scale) into real

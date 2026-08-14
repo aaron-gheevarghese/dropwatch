@@ -1,11 +1,20 @@
-"""Pure-logic tests for the bucketing/sorting structure (no DB), plus a real pub/sub
-verification using fakeredis (the Redis equivalent of moto — an in-memory server, not
-a reimplementation of redis-py's client behavior) since there's no Redis available in
-this sandbox to test against for real.
+"""Pure-logic tests for the bucketing/sorting structure (no DB), plus pub/sub
+verification using fakeredis (the Redis equivalent of moto — an in-memory server, not a
+reimplementation of redis-py's client behavior) so the suite doesn't require a real
+Redis server to run.
+
+Note on scope: fakeredis has no real TCP layer, so it structurally cannot reproduce the
+specific bug this module was hardened against (a real connection silently going dead —
+see _listen_for_invalidations' docstring). That class of failure was verified manually
+against a real local Redis server instead (kill/restart the server mid-run, confirm
+detection + reconnect); it isn't and can't be part of this automated suite. What IS
+covered here: the reconnect-on-error logic itself (test_listener_recovers_after_error)
+using an injected failure, independent of what real-world event would trigger it.
 """
 
 import asyncio
 from decimal import Decimal
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import fakeredis.aioredis
@@ -143,6 +152,48 @@ async def test_pubsub_listener_survives_and_ignores_non_message_events() -> None
     try:
         await asyncio.sleep(0.1)
         assert rebuild_calls == 0, "the subscribe confirmation event must not trigger a rebuild"
+    finally:
+        sync_task.cancel()
+        try:
+            await sync_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_listener_recovers_after_a_connection_error(monkeypatch) -> None:
+    # Simulates any real connection failure (dead socket, server restart, health-check
+    # PING discovering a stale connection) without needing a real one: pubsub() raises
+    # on the first call and works normally after. Proves the reconnect loop itself
+    # works, independent of what triggers it in production.
+    import workers.rule_index as rule_index_module
+
+    monkeypatch.setattr(rule_index_module, "RECONNECT_BACKOFF_SECONDS", 0.05)
+
+    fake_redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    real_pubsub = fake_redis.pubsub
+    attempts = 0
+
+    def _flaky_pubsub(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("simulated dead connection")
+        return real_pubsub(*args, **kwargs)
+
+    fake_redis.pubsub = _flaky_pubsub
+
+    index = RuleIndex()
+    index.rebuild = AsyncMock(return_value=1)
+
+    sync_task = asyncio.create_task(keep_index_fresh(index, fake_redis))
+    try:
+        await asyncio.sleep(0.2)  # past the shrunk backoff — the second (working) attempt should have subscribed
+        assert attempts >= 2, "listener should have retried pubsub() after the simulated failure"
+
+        await fake_redis.publish(settings.rule_index_invalidation_channel, "invalidate")
+        await asyncio.sleep(0.2)
+
+        index.rebuild.assert_awaited()
     finally:
         sync_task.cancel()
         try:

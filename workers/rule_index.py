@@ -99,28 +99,53 @@ class RuleIndex:
         self._buckets = _bucket_rules(rules)
 
 
+# Bounded read, deliberately not pubsub.listen()'s unbounded block(True) read.
+# listen() calls parse_response(block=True) in a loop — with no timeout, a single read
+# blocks forever, and redis-py's health-check PING (check_health()) only runs at the
+# START of a parse_response call. If the connection dies silently (e.g. NAT/Docker
+# networking drops an idle connection without a FIN/RST reaching the client — common
+# in cloud environments, and exactly what happened in production), listen() just hangs
+# on that one dead read forever: no exception, no log line, nothing. Polling with
+# get_message(timeout=...) instead means every read returns on its own on a schedule,
+# giving check_health() a chance to fire (see cache/client.py's health_check_interval)
+# and actually detect the dead connection — at which point it raises, our except below
+# catches it, and the reconnect loop kicks in for real. This class of bug can't be
+# reproduced against fakeredis: there's no real TCP layer for a connection to silently
+# die on, which is exactly why it passed there and hung in production.
+GET_MESSAGE_TIMEOUT_SECONDS = 10
+RECONNECT_BACKOFF_SECONDS = 10
+
+
 async def _listen_for_invalidations(index: RuleIndex, redis_client: Redis) -> None:
     channel = settings.rule_index_invalidation_channel
     while True:
         try:
             pubsub = redis_client.pubsub()
             await pubsub.subscribe(channel)
+            logger.info("rule index: subscribed to channel %r, listening for invalidations", channel)
             try:
-                async for message in pubsub.listen():
-                    if message["type"] != "message":
+                while True:
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=GET_MESSAGE_TIMEOUT_SECONDS
+                    )
+                    if message is None:
+                        logger.debug("rule index: poll on %r returned nothing (idle)", channel)
                         continue
+
+                    logger.info("rule index: invalidation received on %r: %r", channel, message)
                     try:
                         count = await index.rebuild()
-                        logger.info("rule index invalidation received, rebuilt with %d rules", count)
+                        logger.info("rule index: rebuilt with %d rules after invalidation", count)
                     except Exception:
-                        logger.exception("rule index rebuild after invalidation failed; keeping previous index")
+                        logger.exception("rule index: rebuild after invalidation failed; keeping previous index")
             finally:
                 await pubsub.unsubscribe(channel)
         except Exception:
-            # Redis unreachable, connection dropped, etc. Don't crash the worker over
-            # this — the periodic refresh below covers the gap until it recovers.
-            logger.exception("rule index pub/sub listener error; retrying in 10s")
-            await asyncio.sleep(10)
+            # Redis unreachable, connection dropped/detected-dead by the health check,
+            # etc. Don't crash the worker over this — the periodic refresh below covers
+            # the gap until reconnection succeeds.
+            logger.exception("rule index: pub/sub listener error, reconnecting in %ds", RECONNECT_BACKOFF_SECONDS)
+            await asyncio.sleep(RECONNECT_BACKOFF_SECONDS)
 
 
 async def _periodic_refresh(index: RuleIndex) -> None:
@@ -128,9 +153,9 @@ async def _periodic_refresh(index: RuleIndex) -> None:
         await asyncio.sleep(settings.rule_index_refresh_interval_seconds)
         try:
             count = await index.rebuild()
-            logger.info("rule index periodic refresh: %d rules", count)
+            logger.info("rule index: periodic refresh rebuilt with %d rules", count)
         except Exception:
-            logger.exception("periodic rule index refresh failed")
+            logger.exception("rule index: periodic refresh failed")
 
 
 async def keep_index_fresh(index: RuleIndex, redis_client: Redis) -> None:

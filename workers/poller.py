@@ -163,7 +163,7 @@ async def main() -> None:
     # Must complete before any message is processed — otherwise evaluate_rules_for_pair
     # would silently see an empty index for however long the first build takes.
     count = await rule_index.rebuild()
-    logger.info("rule index ready: %d rules", count)
+    logger.info("rule index: initial build ready with %d rules", count)
 
     redis_client = get_redis_client()
     index_sync_task = asyncio.create_task(keep_index_fresh(rule_index, redis_client))
