@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 
-from api.routes import pairs, rules
+from api.routes import alerts, pairs, rules
 from config.settings import settings
 from providers.kraken import KrakenProvider
 
@@ -23,3 +23,4 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="dropwatch", lifespan=lifespan)
 app.include_router(pairs.router)
 app.include_router(rules.router)
+app.include_router(alerts.router)

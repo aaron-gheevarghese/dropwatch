@@ -37,6 +37,23 @@ class CreateRuleRequest(BaseModel):
         return self
 
 
+class UpdateRuleRequest(BaseModel):
+    """Partial update — only fields explicitly provided are changed. user_id, pair_id,
+    and rule_type are intentionally not patchable: changing what a rule fundamentally
+    is or belongs to is closer to delete-and-recreate than a modification.
+    """
+
+    threshold: Decimal | None = None
+    percent: Decimal | None = None
+    window_seconds: int | None = None
+    sigma: Decimal | None = None
+    direction: str | None = None
+    cooldown_seconds: int | None = Field(default=None, ge=0)
+    is_enabled: bool | None = None
+
+    model_config = {"extra": "forbid"}
+
+
 class RuleResponse(BaseModel):
     id: UUID
     user_id: UUID
@@ -81,6 +98,30 @@ async def create_rule(
         is_enabled=body.is_enabled,
     )
     session.add(rule)
+    await session.commit()
+    await session.refresh(rule)
+    return rule
+
+
+@router.patch("/{rule_id}", response_model=RuleResponse)
+async def update_rule(
+    rule_id: UUID,
+    body: UpdateRuleRequest,
+    session: AsyncSession = Depends(get_session),
+) -> AlertRule:
+    rule = await session.get(AlertRule, rule_id)
+    if rule is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"rule {rule_id} not found")
+
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(rule, field, value)
+
+    if rule.rule_type in IMPLEMENTED_RULE_TYPES and rule.threshold is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"threshold is required for rule_type={rule.rule_type!r}",
+        )
+
     await session.commit()
     await session.refresh(rule)
     return rule
