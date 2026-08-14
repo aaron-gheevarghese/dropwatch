@@ -63,7 +63,8 @@ async def poll_due_pairs(provider: MarketDataProvider, session: AsyncSession) ->
                 last_price=quote.last,
                 bid_price=quote.bid,
                 ask_price=quote.ask,
-                checked_at=checked_at,
+                volume_24h=quote.volume_24h,
+                observed_at=checked_at,
             )
         )
         pair.current_last_price = quote.last

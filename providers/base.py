@@ -15,12 +15,13 @@ class ResolvedPair:
 
 @dataclass(frozen=True)
 class Quote:
-    """A single point-in-time last/bid/ask observation for one pair."""
+    """A single point-in-time last/bid/ask/volume observation for one pair."""
 
     canonical_name: str
     last: Decimal
     bid: Decimal
     ask: Decimal
+    volume_24h: Decimal
 
 
 @dataclass(frozen=True)
@@ -51,7 +52,7 @@ class MarketDataProvider(ABC):
 
     @abstractmethod
     async def get_quotes(self, canonical_names: list[str]) -> dict[str, Quote]:
-        """Fetch last/bid/ask for a batch of canonical pair names. Used by the poller."""
+        """Fetch last/bid/ask/volume for a batch of canonical pair names. Used by the poller."""
 
     @abstractmethod
     async def get_usd_market_snapshot(self) -> dict[str, MarketSnapshot]:

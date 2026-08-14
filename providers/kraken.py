@@ -98,6 +98,7 @@ class KrakenProvider(MarketDataProvider):
                 last=Decimal(info["c"][0]),
                 bid=Decimal(info["b"][0]),
                 ask=Decimal(info["a"][0]),
+                volume_24h=Decimal(info["v"][1]),
             )
             for pair, info in result.items()
         }

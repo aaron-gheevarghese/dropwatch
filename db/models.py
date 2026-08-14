@@ -53,7 +53,10 @@ class PriceHistory(Base):
     last_price: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
     bid_price: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
     ask_price: Mapped[Decimal] = mapped_column(Numeric(24, 8), nullable=False)
+    # 24h volume at observation time (Kraken's v[1]). Nullable: rows written before this
+    # column existed have no value and can't be backfilled accurately; every new poll writes it.
+    volume_24h: Mapped[Decimal | None] = mapped_column(Numeric(24, 8), nullable=True)
 
-    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     pair: Mapped["Pair"] = relationship(back_populates="price_history")
