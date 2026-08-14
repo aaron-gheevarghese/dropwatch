@@ -16,5 +16,13 @@ class Settings(BaseSettings):
 
     default_poll_interval_seconds: int = 60
 
+    # boto3 picks up credentials from its default chain (EC2 instance role in
+    # deployment); no static AWS access keys are configured here.
+    aws_region: str = "us-east-1"
+    sqs_poll_queue_name: str = "dropwatch-poll-queue"
+    sqs_poll_dlq_name: str = "dropwatch-poll-dlq"
+    sqs_visibility_timeout_seconds: int = 30
+    sqs_max_receive_count: int = 5
+
 
 settings = Settings()

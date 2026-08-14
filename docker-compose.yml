@@ -1,0 +1,14 @@
+services:
+  scheduler:
+    build: .
+    command: python -m workers.scheduler
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  poller:
+    build: .
+    command: python -m workers.poller
+    env_file:
+      - .env
+    restart: unless-stopped
