@@ -12,6 +12,13 @@ Within each pair's bucket:
     direction against a single shared z-score computed once per pair), and the
     per-rule check is O(1) once that z-score is known, so there's nothing to
     short-circuit — it's just a small unsorted list.
+  - spread_widen is the same shape as zscore_move for this purpose: every rule for a
+    pair shares one computed spread (there's only one bid/ask per observation), so
+    checking each rule's percent against it is already O(1) regardless of order.
+  - percent_change can't share a single computed value across rules the way the two
+    above do — different rules can have different window_seconds, each needing its own
+    past-price lookup — so it's unsorted too. (rules/evaluator.py caches that lookup per
+    distinct window_seconds within one evaluation, not per rule.)
 
 Freshness: rebuilt from Postgres on worker start, on a Redis pub/sub invalidation
 signal (published by POST/PATCH /rules), and periodically as a safety net in case a
@@ -44,6 +51,8 @@ class PairRules:
     absolute_below: list[AlertRule] = field(default_factory=list)  # sorted desc by threshold
     absolute_above: list[AlertRule] = field(default_factory=list)  # sorted asc by threshold
     zscore_move: list[AlertRule] = field(default_factory=list)  # unsorted
+    percent_change: list[AlertRule] = field(default_factory=list)  # unsorted
+    spread_widen: list[AlertRule] = field(default_factory=list)  # unsorted
 
 
 _EMPTY_PAIR_RULES = PairRules()
@@ -61,6 +70,8 @@ def _bucket_rules(rules: list[AlertRule]) -> dict[UUID, PairRules]:
             absolute_below=sorted(by_type["absolute_below"], key=lambda r: r.threshold, reverse=True),
             absolute_above=sorted(by_type["absolute_above"], key=lambda r: r.threshold),
             zscore_move=by_type["zscore_move"],
+            percent_change=by_type["percent_change"],
+            spread_widen=by_type["spread_widen"],
         )
         for pair_id, by_type in grouped.items()
     }
@@ -88,7 +99,10 @@ class RuleIndex:
     async def rebuild(self) -> int:
         buckets = await _load_buckets_from_db()
         self._buckets = buckets  # atomic reference swap
-        return sum(len(b.absolute_below) + len(b.absolute_above) + len(b.zscore_move) for b in buckets.values())
+        return sum(
+            len(b.absolute_below) + len(b.absolute_above) + len(b.zscore_move) + len(b.percent_change) + len(b.spread_widen)
+            for b in buckets.values()
+        )
 
     def replace_with_rules(self, rules: list[AlertRule]) -> None:
         """Builds buckets directly from the given rules, bypassing Postgres entirely.

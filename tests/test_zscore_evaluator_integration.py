@@ -90,7 +90,9 @@ async def test_current_price_is_visible_via_autoflush_and_anomaly_fires(db_sessi
         )
     )
 
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
+    created = await evaluate_rules_for_pair(
+        db_session, pair, current_price, current_price, current_price, current_time, rule_index
+    )
     assert len(created) == 1
     assert created[0].type == "zscore_move"
     assert created[0].detected_price == current_price
@@ -112,7 +114,9 @@ async def test_normal_jitter_does_not_fire(db_session) -> None:
             observed_at=current_time,
         )
     )
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
+    created = await evaluate_rules_for_pair(
+        db_session, pair, current_price, current_price, current_price, current_time, rule_index
+    )
     assert created == []
 
 
@@ -131,7 +135,9 @@ async def test_insufficient_history_never_fires_regardless_of_move_size(db_sessi
             observed_at=current_time,
         )
     )
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
+    created = await evaluate_rules_for_pair(
+        db_session, pair, current_price, current_price, current_price, current_time, rule_index
+    )
     assert created == []
 
 
@@ -150,7 +156,9 @@ async def test_zero_variance_fallback_respects_configured_minimum_percent(db_ses
             observed_at=current_time,
         )
     )
-    created_small = await evaluate_rules_for_pair(db_session, pair, small_move_price, current_time, rule_index)
+    created_small = await evaluate_rules_for_pair(
+        db_session, pair, small_move_price, small_move_price, small_move_price, current_time, rule_index
+    )
     assert created_small == []
 
     # Above the threshold -- fires via the fallback.
@@ -162,7 +170,9 @@ async def test_zero_variance_fallback_respects_configured_minimum_percent(db_ses
             observed_at=current_time_2,
         )
     )
-    created_big = await evaluate_rules_for_pair(db_session, pair, big_move_price, current_time_2, rule_index)
+    created_big = await evaluate_rules_for_pair(
+        db_session, pair, big_move_price, big_move_price, big_move_price, current_time_2, rule_index
+    )
     assert len(created_big) == 1
 
 
@@ -181,7 +191,9 @@ async def test_direction_up_ignores_a_drop(db_session) -> None:
             observed_at=current_time,
         )
     )
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
+    created = await evaluate_rules_for_pair(
+        db_session, pair, current_price, current_price, current_price, current_time, rule_index
+    )
     assert created == []
 
 
@@ -200,5 +212,7 @@ async def test_direction_down_ignores_a_rise(db_session) -> None:
             observed_at=current_time,
         )
     )
-    created = await evaluate_rules_for_pair(db_session, pair, current_price, current_time, rule_index)
+    created = await evaluate_rules_for_pair(
+        db_session, pair, current_price, current_price, current_price, current_time, rule_index
+    )
     assert created == []

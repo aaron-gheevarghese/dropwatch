@@ -1,8 +1,25 @@
 """Evaluates AlertRules against a freshly observed price and fires Notification +
 OutboxEvent rows in the same transaction as the PriceHistory write that triggered them.
 
-absolute_below/absolute_above/zscore_move are implemented — percent_change and
-spread_widen remain Step 7.
+All five rule types are implemented: absolute_below, absolute_above, zscore_move,
+percent_change, spread_widen.
+
+percent_change compares the current price against the price "as of" window_seconds ago
+— defined as the most recent real observation at or before that instant (never a
+row chronologically after it — no look-ahead — and never interpolated: if the pair
+has less than window_seconds of history, there's nothing to compare against and the
+rule can't fire, same "insufficient history means no fire" treatment as zscore_move).
+Different percent_change rules for the same pair can have different window_seconds, so
+unlike zscore_move's one-shared-value-per-pair pattern, the past-price lookup is cached
+per distinct window_seconds within one evaluation, not computed once for the whole pair.
+
+spread_widen needs bid/ask, not just last_price, so evaluate_rules_for_pair takes both
+alongside last_price now.
+
+`percent` fields are percentage numbers, not raw fractions (0.5 means 0.5%, matching
+zscore_zero_variance_min_percent's existing convention) — a rule's underlying formula is
+always computed as a raw ratio and then multiplied by 100 before comparing against
+`percent`.
 
 Rules come from the in-memory RuleIndex (workers/rule_index.py), not a per-pair DB
 query — that's Step 6's whole point. Rule objects in the index were loaded by a
@@ -34,7 +51,7 @@ Two independent guards apply, in order:
 import hashlib
 import json
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID
 
@@ -111,6 +128,39 @@ def zscore_rule_fires(rule: AlertRule, result: ZScoreResult | None, zero_varianc
     return abs(z) >= sigma
 
 
+def percent_change_rule_fires(rule: AlertRule, current_price: Decimal, past_price: Decimal | None) -> bool:
+    if past_price is None or past_price == 0 or rule.percent is None:
+        return False
+
+    change_percent = (current_price - past_price) / past_price * 100
+    direction = rule.direction or "both"
+    if direction == "down":
+        return change_percent <= -rule.percent
+    if direction == "up":
+        return change_percent >= rule.percent
+    return abs(change_percent) >= rule.percent
+
+
+def spread_widen_rule_fires(rule: AlertRule, bid_price: Decimal, ask_price: Decimal) -> bool:
+    if rule.percent is None or bid_price is None or bid_price == 0:
+        return False
+    spread_percent = (ask_price - bid_price) / bid_price * 100
+    return spread_percent >= rule.percent
+
+
+async def _fetch_price_at_or_before(session: AsyncSession, pair: Pair, cutoff: datetime) -> Decimal | None:
+    # "Price as of window_seconds ago" = the most recent real observation at or before
+    # that instant — never a row chronologically after it (no look-ahead), never
+    # interpolated (if none exists, there's genuinely nothing to compare against).
+    result = await session.execute(
+        select(PriceHistory.last_price)
+        .where(PriceHistory.pair_id == pair.id, PriceHistory.observed_at <= cutoff)
+        .order_by(PriceHistory.observed_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def _fetch_recent_prices(session: AsyncSession, pair: Pair, limit: int) -> list[Decimal]:
     # Ordinary SELECT — autoflush means the PriceHistory row the poller just added for
     # this exact observation (pending, not yet committed) is flushed and visible here
@@ -130,9 +180,12 @@ async def _fetch_recent_prices(session: AsyncSession, pair: Pair, limit: int) ->
 def _format_message(
     pair: Pair,
     rule: AlertRule,
-    price: Decimal,
+    last_price: Decimal,
     observed_at: datetime,
     zscore_result: ZScoreResult | None = None,
+    past_price: Decimal | None = None,
+    bid_price: Decimal | None = None,
+    ask_price: Decimal | None = None,
 ) -> str:
     timestamp = observed_at.astimezone(UTC).isoformat()
 
@@ -143,10 +196,27 @@ def _format_message(
             detail = f"flat-window fallback move of {percent:+.3f}% (baseline window had zero variance)"
         else:
             detail = f"z={zscore_result.z:+.2f} (sigma threshold {rule.sigma}, return {percent:+.3f}%)"
-        return f"{pair.display_name} z-score move: {detail} (observed {price} at {timestamp})"
+        return f"{pair.display_name} z-score move: {detail} (observed {last_price} at {timestamp})"
+
+    if rule.rule_type == "percent_change":
+        assert past_price is not None
+        change_percent = (last_price - past_price) / past_price * 100
+        return (
+            f"{pair.display_name} moved {change_percent:+.3f}% over {rule.window_seconds}s "
+            f"(threshold {rule.percent}%, direction {rule.direction or 'both'}; "
+            f"{past_price} -> {last_price} at {timestamp})"
+        )
+
+    if rule.rule_type == "spread_widen":
+        assert bid_price is not None and ask_price is not None
+        spread_percent = (ask_price - bid_price) / bid_price * 100
+        return (
+            f"{pair.display_name} spread widened to {spread_percent:.3f}% "
+            f"(threshold {rule.percent}%; bid={bid_price} ask={ask_price} at {timestamp})"
+        )
 
     direction_text = "dropped below" if rule.rule_type == "absolute_below" else "rose above"
-    return f"{pair.display_name} {direction_text} {rule.threshold} (observed {price} at {timestamp})"
+    return f"{pair.display_name} {direction_text} {rule.threshold} (observed {last_price} at {timestamp})"
 
 
 def _in_cooldown(rule: AlertRule, observed_at: datetime) -> bool:
@@ -169,17 +239,23 @@ def _matching_absolute_rules(rules: list[AlertRule], price: Decimal) -> list[Ale
 
 
 async def evaluate_rules_for_pair(
-    session: AsyncSession, pair: Pair, price: Decimal, observed_at: datetime, rule_index: RuleIndex
+    session: AsyncSession,
+    pair: Pair,
+    last_price: Decimal,
+    bid_price: Decimal,
+    ask_price: Decimal,
+    observed_at: datetime,
+    rule_index: RuleIndex,
 ) -> list[Notification]:
-    """Fires any absolute_below/absolute_above/zscore_move rule for this pair that the
-    given price qualifies for. Returns the Notifications actually created — delivered
+    """Fires any rule for this pair that the given observation qualifies for, across all
+    five implemented rule types. Returns the Notifications actually created — delivered
     or suppressed — empty if nothing fired or everything was a duplicate of an
     already-recorded detected state.
     """
     pair_rules = rule_index.rules_for_pair(pair.id)
 
-    candidates: list[AlertRule] = _matching_absolute_rules(pair_rules.absolute_below, price)
-    candidates += _matching_absolute_rules(pair_rules.absolute_above, price)
+    candidates: list[AlertRule] = _matching_absolute_rules(pair_rules.absolute_below, last_price)
+    candidates += _matching_absolute_rules(pair_rules.absolute_above, last_price)
 
     zscore_result: ZScoreResult | None = None
     if pair_rules.zscore_move:
@@ -193,10 +269,31 @@ async def evaluate_rules_for_pair(
             if zscore_rule_fires(rule, zscore_result, settings.zscore_zero_variance_min_percent)
         ]
 
+    # Different percent_change rules can use different window_seconds, so there's no
+    # single shared baseline the way zscore has — but rules sharing the same
+    # window_seconds share one lookup rather than each re-querying.
+    past_price_by_rule_id: dict[UUID, Decimal | None] = {}
+    if pair_rules.percent_change:
+        past_price_by_window: dict[int, Decimal | None] = {}
+        for rule in pair_rules.percent_change:
+            window = rule.window_seconds
+            if window not in past_price_by_window:
+                cutoff = observed_at - timedelta(seconds=window)
+                past_price_by_window[window] = await _fetch_price_at_or_before(session, pair, cutoff)
+            past_price = past_price_by_window[window]
+            past_price_by_rule_id[rule.id] = past_price
+            if percent_change_rule_fires(rule, last_price, past_price):
+                candidates.append(rule)
+
+    if pair_rules.spread_widen:
+        candidates += [
+            rule for rule in pair_rules.spread_widen if spread_widen_rule_fires(rule, bid_price, ask_price)
+        ]
+
     created: list[Notification] = []
 
     for rule in candidates:
-        state_hash = compute_detected_state_hash(rule, price, observed_at)
+        state_hash = compute_detected_state_hash(rule, last_price, observed_at)
         idempotency_key = compute_idempotency_key(rule.id, pair.id, state_hash)
 
         existing = await session.scalar(
@@ -211,7 +308,7 @@ async def evaluate_rules_for_pair(
             rule_id=rule.id,
             pair_id=pair.id,
             type=rule.rule_type,
-            detected_price=price,
+            detected_price=last_price,
             detected_state_hash=state_hash,
             idempotency_key=idempotency_key,
             status=STATUS_SUPPRESSED_COOLDOWN if suppressed else STATUS_PENDING,
@@ -229,6 +326,7 @@ async def evaluate_rules_for_pair(
             continue
 
         if not suppressed:
+            rule_past_price = past_price_by_rule_id.get(rule.id)
             payload = json.dumps(
                 {
                     "notification_id": str(notification.id),
@@ -237,12 +335,19 @@ async def evaluate_rules_for_pair(
                     "pair_display_name": pair.display_name,
                     "rule_type": rule.rule_type,
                     "threshold": str(rule.threshold) if rule.threshold is not None else None,
+                    "percent": str(rule.percent) if rule.percent is not None else None,
+                    "window_seconds": rule.window_seconds,
                     "sigma": str(rule.sigma) if rule.sigma is not None else None,
                     "direction": rule.direction,
                     "z_score": zscore_result.z if (rule.rule_type == "zscore_move" and zscore_result) else None,
-                    "detected_price": str(price),
+                    "past_price": str(rule_past_price) if rule_past_price is not None else None,
+                    "bid_price": str(bid_price) if rule.rule_type == "spread_widen" else None,
+                    "ask_price": str(ask_price) if rule.rule_type == "spread_widen" else None,
+                    "detected_price": str(last_price),
                     "triggered_at": observed_at.astimezone(UTC).isoformat(),
-                    "message": _format_message(pair, rule, price, observed_at, zscore_result),
+                    "message": _format_message(
+                        pair, rule, last_price, observed_at, zscore_result, rule_past_price, bid_price, ask_price
+                    ),
                 }
             )
             session.add(OutboxEvent(notification_id=notification.id, payload=payload))

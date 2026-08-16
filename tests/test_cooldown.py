@@ -59,7 +59,7 @@ async def test_sustained_move_delivers_once_and_suppresses_the_rest(db_session) 
     fired: list[Notification] = []
     for price, offset in zip(prices, offsets, strict=True):
         observed_at = base + timedelta(seconds=offset)
-        created = await evaluate_rules_for_pair(db_session, pair, price, observed_at, rule_index)
+        created = await evaluate_rules_for_pair(db_session, pair, price, price, price, observed_at, rule_index)
         assert len(created) == 1
         fired.append(created[0])
 
@@ -94,7 +94,9 @@ async def test_sustained_move_delivers_once_and_suppresses_the_rest(db_session) 
     # Past the cooldown window measured from the LAST fire (t0+120s), a new qualifying
     # move should deliver again.
     past_cooldown = base + timedelta(seconds=120 + COOLDOWN_SECONDS + 1)
-    resumed = await evaluate_rules_for_pair(db_session, pair, Decimal("850"), past_cooldown, rule_index)
+    resumed = await evaluate_rules_for_pair(
+        db_session, pair, Decimal("850"), Decimal("850"), Decimal("850"), past_cooldown, rule_index
+    )
     assert len(resumed) == 1
     assert resumed[0].status == STATUS_PENDING
 
@@ -109,7 +111,7 @@ async def test_sustained_move_delivers_once_and_suppresses_the_rest(db_session) 
 async def test_first_ever_fire_is_never_suppressed(db_session) -> None:
     pair, _rule, rule_index = await _make_pair_and_cooldown_rule(db_session)
     created = await evaluate_rules_for_pair(
-        db_session, pair, Decimal("900"), datetime(2026, 8, 15, 9, 0, 0, tzinfo=UTC), rule_index
+        db_session, pair, Decimal("900"), Decimal("900"), Decimal("900"), datetime(2026, 8, 15, 9, 0, 0, tzinfo=UTC), rule_index
     )
     assert len(created) == 1
     assert created[0].status == STATUS_PENDING
@@ -143,8 +145,10 @@ async def test_zero_cooldown_never_suppresses(db_session) -> None:
     rule_index.replace_with_rules([rule])
 
     base = datetime(2026, 8, 15, 9, 0, 0, tzinfo=UTC)
-    first = await evaluate_rules_for_pair(db_session, pair, Decimal("900"), base, rule_index)
-    second = await evaluate_rules_for_pair(db_session, pair, Decimal("899"), base + timedelta(seconds=1), rule_index)
+    first = await evaluate_rules_for_pair(db_session, pair, Decimal("900"), Decimal("900"), Decimal("900"), base, rule_index)
+    second = await evaluate_rules_for_pair(
+        db_session, pair, Decimal("899"), Decimal("899"), Decimal("899"), base + timedelta(seconds=1), rule_index
+    )
 
     assert first[0].status == STATUS_PENDING
     assert second[0].status == STATUS_PENDING

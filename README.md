@@ -12,7 +12,7 @@ one Redis instance:
 
 | Process | Does |
 | --- | --- |
-| `api` (FastAPI) | `POST/GET /pairs`, `POST/PATCH /rules`, `GET /alerts` |
+| `api` (FastAPI) | `POST/GET /pairs`, `POST/PATCH /rules`, `POST /rules/backtest`, `GET /alerts` |
 | `workers/discovery.py` | Daily job. Scans all Kraken USD pairs, tracks/untracks by a $100k/$75k notional-volume hysteresis floor |
 | `workers/scheduler.py` | Every 5s, enqueues one staggered SQS message per pair that's due for a poll |
 | `workers/poller.py` | SQS consumer. Batches due pairs into one Kraken `Ticker` call, writes `PriceHistory`, evaluates alert rules against an in-memory rule index, commits — deletes the SQS message only on success |
@@ -24,13 +24,15 @@ a `Notification` + `OutboxEvent` in the *same transaction* as the price observat
 `outbox_publisher` is the only thing that talks to SNS, decoupled from evaluation so a
 firing is never lost even if SNS is briefly unreachable.
 
-Rule evaluation (`rules/evaluator.py`) supports three rule types: `absolute_below`/
-`absolute_above` (fixed threshold) and `zscore_move` (statistical: fires when a price's
-log return is an outlier relative to that pair's own recent rolling volatility, not a
-fixed percentage — see `workers/zscore_filter.py` and the measurement note below).
-Rules come from `workers/rule_index.py`, an in-memory index bucketed by pair and
-pre-sorted so evaluation short-circuits instead of scanning every rule — see
-[Rule index](#rule-index) below for why and by how much.
+Rule evaluation (`rules/evaluator.py`) supports all five rule types: `absolute_below`/
+`absolute_above` (fixed threshold), `zscore_move` (statistical: fires when a price's log
+return is an outlier relative to that pair's own recent rolling volatility, not a fixed
+percentage — see `workers/zscore_filter.py` and the measurement note below),
+`percent_change` (price moved more than `percent`% over the trailing `window_seconds`,
+compared against the most recent real observation at or before that instant — never
+interpolated), and `spread_widen` (`(ask - bid) / bid` exceeds `percent`%). Rules come
+from `workers/rule_index.py`, an in-memory index bucketed by pair and pre-sorted where a
+short-circuit is possible — see [Rule index](#rule-index) below for why and by how much.
 
 ```
 Kraken API
@@ -161,12 +163,52 @@ it the same way (it'll need `REDIS_URL` too, to publish rule-change invalidation
 ## API
 
 - `POST /pairs`, `GET /pairs` — track/list Kraken pairs
-- `POST /rules` — create an alert rule (`absolute_below`/`absolute_above`/`zscore_move`;
-  `percent_change`/`spread_widen` remain Step 7)
+- `POST /rules` — create an alert rule, any of the five implemented types
 - `PATCH /rules/{id}` — enable, disable, or modify an existing rule
+- `POST /rules/backtest` — replay an unsaved rule definition against real `PriceHistory`
+  for one pair. See [Backtest](#backtest) below.
 - `GET /alerts` — alert history: rule fired, observed price, delivery status (including
   suppression reason), outbox retry diagnostics. Paginated (`limit`/`offset`), filterable
   by `pair_id`, `rule_id`, `status`.
+
+## Backtest
+
+`POST /rules/backtest` takes the same rule-definition fields as `POST /rules` (minus
+`user_id` — nothing is attributed or saved — and `is_enabled`, which isn't meaningful
+for a hypothetical rule) plus `lookback_days`, and replays it against real
+`PriceHistory` for one pair. Returns fire count, fires/day, per-fire timestamps and
+prices, and a post-cooldown count (what would actually have been delivered vs. what
+matched the condition).
+
+It reuses `evaluate_rules_for_pair` — the exact function the live poller calls — row by
+row over history, in its own session that's opened and never committed. That's the
+whole point: results can't drift from what the live engine would actually have done,
+because it's not a separate implementation approximating that behavior, it's the same
+code. The unsaved rule is genuinely `session.add()`/`flush()`'d (not just held in
+memory) so it satisfies `notifications.rule_id`'s real foreign key during replay, the
+same as any other integrity constraint the live path relies on — never committing is
+what makes "no persistence" true, not skipping the insert.
+
+Two bugs surfaced testing this against real data across all 118 tracked pairs, both
+now covered by `tests/test_backtest.py`:
+- A temp rule that's *never* added to the session fails that foreign key on every
+  fire, silently — caught by the same `IntegrityError` handler built for
+  `evaluate_rules_for_pair`'s concurrent-race case — producing a false `fire_count=0`
+  regardless of the rule. (This is why the rule now gets flushed for real, above.)
+- `Notification.triggered_at` is `server_default=func.now()`, and Postgres's `now()`
+  is the *transaction* timestamp — constant across every statement in one bulk replay
+  transaction. Reading it back per-fire reported the same wall-clock instant for every
+  fire regardless of which historical moment actually triggered it. Fixed by tracking
+  each fire's real `observed_at` in the replay loop instead of trusting that column.
+
+Performance note, also found by testing against real data: replay cost scales with
+*fire count*, not row count — 2000+ rows with zero fires replay in a few seconds, since
+non-firing rows only cost an in-memory index lookup; a rule matching a large fraction
+of observations (which isn't a realistic alert threshold anyway) is slow, because each
+fire pays the same real per-fire cost the live poller does (a `SAVEPOINT`, an
+idempotency check, an insert) — over a remote pooled connection, at high fire-density,
+that adds up. Not optimized away, since doing so would mean the backtest no longer
+reuses the live path unchanged.
 
 ## Statistical filter (zscore_move)
 
@@ -274,9 +316,15 @@ working `DATABASE_URL` in `.env` to run.
   instead of a per-pair DB query. Done — see [Rule index](#rule-index) above. Measured
   ~228x per-poll-cycle speedup at the PRD's 400-rules/pair worst case, real Postgres
   timings, not assumed. Full writeup in `docs/rule_index_benchmark_report.md`.
+- **Step 7 — Backtest endpoint, remaining rule types:** `percent_change` and
+  `spread_widen` rule types, wired into `rules/evaluator.py` and
+  `workers/rule_index.py` alongside the other three. `POST /rules/backtest`, reusing
+  `evaluate_rules_for_pair` unchanged rather than a parallel implementation. Done — see
+  [Backtest](#backtest) above, including two real bugs (a silent false-negative and a
+  wrong-timestamp bug) found and fixed by testing against real accumulated data across
+  all 118 tracked pairs rather than only synthetic fixtures.
 - **Not yet built:**
   - EC2 deploy (currently runs from a laptop/dev machine only)
-  - `percent_change`, `spread_widen` rule types (Step 7)
   - Load testing at the 500+ pairs/minute target
   - A way to discover the seeded user's ID via the API (currently: check the DB or
     the seed script's log output)

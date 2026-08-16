@@ -134,7 +134,7 @@ async def process_batch(
         pair.last_checked_at = observed_at
         to_delete.append(message)
 
-        await evaluate_rules_for_pair(session, pair, quote.last, observed_at, rule_index)
+        await evaluate_rules_for_pair(session, pair, quote.last, quote.bid, quote.ask, observed_at, rule_index)
 
     await session.commit()
     await _delete_batch(sqs_client, queue_url, to_delete)
